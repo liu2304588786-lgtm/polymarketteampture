@@ -1,0 +1,23 @@
+{
+  "name": "polymarket-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node src/polymarket-demo.mjs",
+    "demo:clash": "node src/run-with-clash.mjs src/polymarket-demo.mjs",
+    "place-limit": "node src/place-limit-order.mjs",
+    "place-limit:clash": "node src/run-with-clash.mjs src/place-limit-order.mjs",
+    "auto-quote": "node src/auto-quote.mjs",
+    "auto-quote:clash": "node src/run-with-clash.mjs src/auto-quote.mjs",
+    "threshold-buyer": "node src/threshold-buyer.mjs",
+    "threshold-buyer:clash": "node src/run-with-clash.mjs src/threshold-buyer.mjs",
+    "backtest-weather": "node src/backtest-weather.mjs",
+    "backtest-weather:clash": "node src/run-with-clash.mjs src/backtest-weather.mjs"
+  },
+  "dependencies": {
+    "@polymarket/clob-client-v2": "^1.0.0",
+    "dotenv": "^17.4.2",
+    "ethers": "^5.8.0"
+  }
+}

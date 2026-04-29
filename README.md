@@ -1,14 +1,14 @@
-# Polymarket Scripts
+# Polymarket 脚本集
 
-This repo contains several small Node.js scripts:
+这个仓库包含几组基于 Node.js 的小工具脚本：
 
-- `npm run demo`: read public market data and order books
-- `npm run place-limit`: place a Polymarket limit order through the official CLOB SDK
-- `npm run auto-quote`: keep one maker order refreshed automatically
-- `npm run threshold-buyer`: auto-discover weather markets and buy low-priced YES outcomes
-- `npm run backtest-weather`: compare Open-Meteo archive temperatures with Polymarket's settled weather buckets
+- `npm run demo`：读取公开市场数据和订单簿
+- `npm run place-limit`：通过官方 CLOB SDK 提交一笔 Polymarket 限价单
+- `npm run auto-quote`：自动维护一笔 maker 挂单
+- `npm run threshold-buyer`：自动发现天气市场，并在低价时买入 YES
+- `npm run backtest-weather`：用 Open-Meteo 历史温度对比 Polymarket 已结算天气桶
 
-For machines that need to go through the local Clash HTTP proxy on `127.0.0.1:7897`, matching `:clash` commands are also available:
+如果你的机器需要通过本地 Clash HTTP 代理 `127.0.0.1:7897` 访问网络，也提供了对应的 `:clash` 命令：
 
 - `npm run demo:clash`
 - `npm run place-limit:clash`
@@ -16,26 +16,26 @@ For machines that need to go through the local Clash HTTP proxy on `127.0.0.1:78
 - `npm run threshold-buyer:clash`
 - `npm run backtest-weather:clash`
 
-If your Clash HTTP or mixed proxy uses a different port, set `CLASH_PROXY_URL` before running:
+如果你的 Clash HTTP 或 mixed 代理使用了其他端口，运行前先设置 `CLASH_PROXY_URL`：
 
 ```powershell
 $env:CLASH_PROXY_URL="http://127.0.0.1:7890"
 npm run threshold-buyer:clash -- --config config.markets.example.json --dry-run
 ```
 
-## 1. Public market demo
+## 1. 公开市场演示
 
 ```bash
 npm run demo
 ```
 
-If you want the request to explicitly use Clash local proxy:
+如果你希望请求显式走 Clash 本地代理：
 
 ```bash
 npm run demo:clash -- --limit 3
 ```
 
-Useful options:
+常用参数：
 
 ```bash
 npm run demo -- --limit 3 --depth 10
@@ -44,111 +44,111 @@ npm run demo -- --market-id <market-id>
 npm run demo -- --token-id <token-id>
 ```
 
-## 2. Place a limit order
+## 2. 提交限价单
 
-Copy `.env.example` to `.env`, then fill in your wallet values.
+先把 `.env.example` 复制为 `.env`，然后填入你的钱包参数。
 
 ```bash
 npm run place-limit -- --token-id <TOKEN_ID> --side BUY --price 0.42 --size 25
 ```
 
-With Clash local proxy:
+如果需要走 Clash 本地代理：
 
 ```bash
 npm run place-limit:clash -- --token-id <TOKEN_ID> --side BUY --price 0.42 --size 25
 ```
 
-Dry run without posting:
+只做 dry run、不真正发单：
 
 ```bash
 npm run place-limit -- --token-id <TOKEN_ID> --side BUY --price 0.42 --size 25 --dry-run
 ```
 
-### Important env vars
+### 关键环境变量
 
-- `PRIVATE_KEY`: signer private key
-- `POLYMARKET_SIGNATURE_TYPE`: `0`, `1`, `2`, or `3`
-- `POLYMARKET_FUNDER_ADDRESS`: required for proxy wallet setups
-- `CLOB_API_KEY`, `CLOB_SECRET`, `CLOB_PASS_PHRASE`: optional, auto-derived if omitted
+- `PRIVATE_KEY`：签名私钥
+- `POLYMARKET_SIGNATURE_TYPE`：`0`、`1`、`2` 或 `3`
+- `POLYMARKET_FUNDER_ADDRESS`：代理钱包结构下必填
+- `CLOB_API_KEY`、`CLOB_SECRET`、`CLOB_PASS_PHRASE`：可选；如果不填会自动推导
 
-### Notes
+### 说明
 
-- The script resolves `tickSize` and `negRisk` automatically from the SDK before posting.
-- It defaults to `postOnly=true` so the order behaves like a resting maker order.
-- Polymarket docs say:
+- 脚本会在发单前通过 SDK 自动解析 `tickSize` 和 `negRisk`。
+- 默认使用 `postOnly=true`，因此订单行为更接近静态 maker 挂单。
+- Polymarket 文档中这几个签名类型含义如下：
   `0` = EOA
   `1` = POLY_PROXY
   `2` = GNOSIS_SAFE
   `3` = POLY_1271
-- For Polymarket.com accounts, funds are usually in a proxy wallet, so the signer and funder are often not the same address.
+- 对于 Polymarket.com 账户，资金通常放在代理钱包里，所以 signer 地址和 funder 地址往往不是同一个。
 
-## 3. Auto quote strategy
+## 3. Auto quote 策略
 
-This is a simple requoter for one `token_id + side`.
+这是一个针对单个 `token_id + side` 的简单自动改价器。
 
-It does this in a loop:
+它会循环执行下面几步：
 
-1. read the current order book
-2. compute a target maker price
-3. look up your open orders on that token and side
-4. cancel stale orders
-5. place one new resting order if needed
+1. 读取当前订单簿
+2. 计算目标 maker 价格
+3. 查询你在该 token 和 side 上的未成交订单
+4. 取消已经过时的订单
+5. 如有需要，重新挂出一笔新的静态订单
 
-Example:
+示例：
 
 ```bash
 npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --max-price 0.44
 ```
 
-With Clash local proxy:
+如果需要走 Clash 本地代理：
 
 ```bash
 npm run auto-quote:clash -- --token-id <TOKEN_ID> --side BUY --size 25 --max-price 0.44
 ```
 
-Useful knobs:
+常用调节参数：
 
 ```bash
 npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks 1 --min-spread-ticks 2 --replace-threshold-ticks 1 --poll-ms 5000
 ```
 
-Strategy behavior:
+策略行为说明：
 
-- `improve-ticks`: how aggressively to step ahead of the current same-side best price
-- `min-spread-ticks`: minimum distance kept from the opposite side to reduce accidental taking
-- `replace-threshold-ticks`: only cancel/repost when target price drifts enough
-- `max-price`: BUY ceiling
-- `min-price`: SELL floor
+- `improve-ticks`：相对当前同侧最优价，向前提升多少个 tick
+- `min-spread-ticks`：与对手盘之间至少保留多少个 tick，降低误吃单概率
+- `replace-threshold-ticks`：只有目标价偏移足够大时，才会取消并重挂
+- `max-price`：BUY 的最高价
+- `min-price`：SELL 的最低价
 
-Important:
+重要说明：
 
-- This version intentionally manages only one active order per `token_id + side`.
-- It cancels extra same-side orders for that token before quoting.
-- Start with `--dry-run` first to verify the target prices and replacement logic on your market.
+- 当前版本刻意只管理每个 `token_id + side` 下的一笔活跃订单。
+- 在重新报价前，它会先取消该 token 同侧多余的订单。
+- 建议先从 `--dry-run` 开始，确认目标价格和换单逻辑符合预期。
 
 ## 4. Threshold buyer
 
-This script can auto-discover active weather markets for selected cities at startup.
+这个脚本启动时可以自动发现指定城市的活跃天气市场。
 
-The default strategy is:
+默认策略如下：
 
-- auto-discover active `highestTemperature` weather events for `Shenzhen`, `Shanghai`, `Beijing`, `Hong Kong`, `Guangzhou`, and `Taipei`
-- monitor every YES market under those events
-- when the observed YES probability drops below `0.10`, place a `BUY YES` limit order at `0.10`
-- use a fixed size of `20` shares
-- after a successful buy order is posted, the script remembers a take-profit plan for that token
-- when YES reaches `2x` the buy order price, it automatically posts one `SELL YES` order for `50%` of the held position
-- when `weatherForecastFilterEnabled=true`, fetch the forecast temperature range and only monitor buckets around the forecast high/low
-- all cities use the same symmetric rule: round the forecast high, then monitor `±1°C`
-- for example, a forecast high of `28.6°C` rounds to `29°C`, so the script keeps only `28°C`, `29°C`, `30°C`
+- 自动发现 `Shenzhen`、`Shanghai`、`Beijing`、`Hong Kong`、`Guangzhou`、`Taipei` 的活跃 `highestTemperature` 天气事件
+- 监控这些事件下面的所有 YES 市场
+- 当观察到的 YES 概率低于 `0.10` 时，以 `0.10` 挂一笔 `BUY YES` 限价单
+- 固定下单数量为 `20` 份
+- 成功挂出买单后，脚本会为该 token 记录一份止盈计划
+- 当 YES 涨到买入价的 `2x` 时，自动对持仓的 `50%` 挂出一笔 `SELL YES`
+- 当 `weatherForecastFilterEnabled=true` 时，会拉取天气预报区间，只监控靠近预报高温或低温的桶
+- 所有城市都使用同一套对称规则：先把预报高温四舍五入，再监控 `±1°C`
+- 例如，预报高温是 `28.6°C`，四舍五入后为 `29°C`，那么脚本只会保留 `28°C`、`29°C`、`30°C`
 
-This strategy also has an optional high-confidence `NO` branch. When enabled, it uses the same weather forecast window to identify buckets that look excluded, then waits for another bucket in the same event to dominate before buying expensive `NO` near settlement.
+这套策略还包含一个可选的高确定性 `NO` 分支。开启后，它会使用同一套天气预报窗口找出看起来被排除的桶，然后等待同事件中的另一个桶明显占优，再在接近结算时买入高价 `NO`。
 
-### Config
+### 配置
 
-Copy `config.markets.example.json` to `config.markets.json` and edit it.
+把 `config.markets.example.json` 复制为 `config.markets.json`，然后按需修改。
 
-Example:
+示例：
 
 ```json
 {
@@ -193,103 +193,103 @@ Example:
 }
 ```
 
-### Run
+### 运行
 
-Dry run:
+Dry run：
 
 ```bash
 npm run threshold-buyer
 ```
 
-If your network only works reliably through Clash local proxy instead of direct/TUN routing, use:
+如果你的网络通过 Clash 本地代理比直连或 TUN 更稳定，可以使用：
 
 ```bash
 npm run threshold-buyer:clash -- --config config.markets.example.json --dry-run
 ```
 
-Force live mode even if config has `dryRun: true`:
+即使配置里写了 `dryRun: true`，也可以强制切到实盘模式：
 
 ```bash
 npm run threshold-buyer -- --live
 ```
 
-Use another config file:
+使用其他配置文件：
 
 ```bash
 npm run threshold-buyer -- --config my-markets.json
 ```
 
-### Notes
+### 说明
 
-- The script places a `BUY YES` order, not a `NO` order.
-- If `tailNoStrategyEnabled=true`, the script may also place `BUY NO` orders on forecast-excluded buckets that are already close to certainty.
-- It keeps local trigger state in `stateFile` so the same token is not bought every poll while it remains under the threshold.
-- A token is re-armed only after its observed YES price rises back above `rearmYesPrice`.
-- `tailNoRearmPrice` is the mirror rule for the optional `NO` branch: after one `BUY NO`, the token must cool back below this level before it can trigger again.
-- `tailNoOrderSize` lets the optional `NO` branch use its own position size instead of sharing the YES branch sizing.
-- `takeProfitEnabled=true` means the script will watch held YES positions for take-profit after a buy is posted.
-- `takeProfitTargetPrice=0.8` means the script will place one full-position SELL order when YES reaches `0.80`.
-- `minTriggerLiquidityShares=5` means a BUY trigger only fires when the current best ask shows at least 5 shares of displayed depth.
-- `minTakeProfitLiquidityShares=5` means take-profit only fires when the current best bid shows at least 5 shares of displayed depth.
-- `maxStrategyTokensPerEvent=2` limits the strategy to at most 2 active YES tokens per weather event, which reduces non-atomic execution risk across mutually exclusive buckets.
-- `tailNoMaxStrategyTokensPerEvent` is the separate event-level cap for the optional `NO` branch, so high-certainty sweeps do not consume the YES branch budget.
-- `relativeMispricingFilterEnabled=true` means a BUY trigger must also look cheap relative to the other monitored buckets in the same event.
-- `relativeMispricingMinDiscount=0.03` means the current best ask must be at least `0.03` below the monitored event median price.
-- `relativeMispricingMaxPriceRank=2` means the current best ask must rank among the 2 cheapest monitored buckets in the same event.
-- If there are existing open `BUY` orders on the same YES token, the script cancels them before placing the new threshold order.
-- `autoDiscoverWeatherMarkets=true` means the script searches active weather events for your configured cities at startup without needing event URLs.
-- `allowedCities` lets you restrict monitoring to selected cities such as `Shenzhen`, `Shanghai`, `Beijing`, `Hong Kong`, `Guangzhou`, `Taipei`.
-- `tailNoAllowedCities` is the separate city whitelist for the optional `NO` branch; if omitted in your own config, you can keep it identical to `allowedCities` or narrow it to only the cities where near-settlement NO sweeps make sense.
-- `weatherCategory=highestTemperature` restricts the monitor to highest-temperature markets.
-- `weatherForecastFilterEnabled=true` means the script uses Open-Meteo forecast data to filter temperature buckets before trading.
-- `weatherForecastWindowC=1` means every city keeps only buckets within rounded forecast high/low `± 1°C`; for highest-temperature markets it uses the forecast daily high.
-- `weatherForecastTimezone=Asia/Shanghai` keeps the forecast date aligned with China/Hong Kong local dates.
-- `tailNoMinBucketGapC=2` means the optional `NO` branch only considers buckets that sit at least `2掳C` outside the forecast window.
-- `tailNoMaxDaysAhead=0` keeps the optional `NO` branch focused on same-day markets, closer to a near-resolution certainty sweep than a long-dated opinion trade.
-- `tailNoRequireDominantYes=true` plus `tailNoDominantYesThreshold=0.93` means the optional `NO` branch only fires after another bucket in the same event is already trading like the likely winner.
-- `tailNoTriggerPrice=0.98` means the optional `NO` branch only buys when the observed `NO` price is already at `98%+`.
-- `tailNoMaxOrderPrice=0.999` caps the optional `BUY NO` limit price so the script lifts only near-certain offers and does not chase past your ceiling.
-- `orderYesPrice` is the limit price the script posts when triggered. With the default config, it buys when YES is below `0.10` and still posts the order at exactly `0.10`.
-- BUY decisions now require both an absolute trigger and an event-relative cheapness signal, instead of relying on the absolute `0.10` rule alone.
-- Trigger and take-profit decisions now prefer actionable orderbook prices (`best ask` for BUY checks, `best bid` for SELL checks) instead of leaning on stale last-trade snapshots.
-- `dominantYesSkipThreshold=0.9` means that if any option inside the same weather event already reaches `90%+`, the script skips that whole event and does not place more orders there.
-- `minTemperatureByCity` lets you apply per-city bucket filters only when weather forecast filtering is disabled.
-- If a YES token already has a real position in your account, the script skips that token and will not place a duplicate order for the same option.
-- Tokens without a CLOB orderbook are skipped quietly so long-running sessions stay readable.
-- On startup, the script prints only the final monitoring ranges grouped by `city + date`.
-- During the loop, normal skips are quiet; the script only prints successful BUY orders and successful take-profit SELL orders.
+- 这个脚本的主逻辑是挂 `BUY YES`，不是直接挂 `NO`。
+- 如果 `tailNoStrategyEnabled=true`，脚本也可能会在已经接近确定性的“预报排除桶”上挂 `BUY NO`。
+- 它会把本地触发状态保存在 `stateFile` 中，避免同一个 token 在持续低于阈值时每次轮询都重复买入。
+- 只有当观察到的 YES 价格重新回升到 `rearmYesPrice` 以上，该 token 才会重新进入可触发状态。
+- `tailNoRearmPrice` 是可选 `NO` 分支的镜像规则：一旦触发过一次 `BUY NO`，必须先回落到这个值以下，才允许再次触发。
+- `tailNoOrderSize` 允许可选 `NO` 分支使用独立仓位大小，而不是与 YES 分支共用。
+- `takeProfitEnabled=true` 表示在买单挂出后，脚本会继续监控已持有的 YES 仓位是否满足止盈条件。
+- `takeProfitTargetPrice=0.8` 表示当 YES 到达 `0.80` 时，脚本会挂一笔整仓卖单。
+- `minTriggerLiquidityShares=5` 表示只有在当前最优卖价至少展示 `5` 份深度时，才会触发 BUY。
+- `minTakeProfitLiquidityShares=5` 表示只有在当前最优买价至少展示 `5` 份深度时，才会触发止盈。
+- `maxStrategyTokensPerEvent=2` 表示每个天气事件最多同时持有 `2` 个活跃 YES token，用来降低互斥桶之间非原子执行的风险。
+- `tailNoMaxStrategyTokensPerEvent` 是可选 `NO` 分支独立的事件级上限，因此高确定性扫尾不会占用 YES 分支的额度。
+- `relativeMispricingFilterEnabled=true` 表示 BUY 触发除了满足绝对价格阈值外，还必须在同事件的监控桶里显得足够便宜。
+- `relativeMispricingMinDiscount=0.03` 表示当前最优卖价必须至少比该事件监控桶的中位数低 `0.03`。
+- `relativeMispricingMaxPriceRank=2` 表示当前最优卖价必须排在该事件最便宜的前 `2` 个监控桶之内。
+- 如果同一个 YES token 已经存在未成交的 `BUY` 订单，脚本会先取消它们，再挂出新的阈值单。
+- `autoDiscoverWeatherMarkets=true` 表示脚本启动时会自动扫描你配置城市下的活跃天气事件，不需要手动填写事件 URL。
+- `allowedCities` 可以把监控范围限制在指定城市，例如 `Shenzhen`、`Shanghai`、`Beijing`、`Hong Kong`、`Guangzhou`、`Taipei`。
+- `tailNoAllowedCities` 是可选 `NO` 分支独立的城市白名单；如果你自己的配置里不写，可以保持和 `allowedCities` 一样，或者只收窄到适合做近结算 NO 扫尾的城市。
+- `weatherCategory=highestTemperature` 表示只监控最高温市场。
+- `weatherForecastFilterEnabled=true` 表示脚本会在交易前使用 Open-Meteo 预报数据对温度桶做过滤。
+- `weatherForecastWindowC=1` 表示每个城市只保留处于四舍五入后的预报高温或低温 `±1°C` 范围内的桶；对于最高温市场，使用的是每日预报最高温。
+- `weatherForecastTimezone=Asia/Shanghai` 用来让预报日期与中国大陆或香港本地日期保持一致。
+- `tailNoMinBucketGapC=2` 表示可选 `NO` 分支只考虑那些至少离预报窗口 `2°C` 之外的桶。
+- `tailNoMaxDaysAhead=0` 表示可选 `NO` 分支只关注当天市场，更接近临近结算时的高确定性扫尾，而不是长周期观点单。
+- `tailNoRequireDominantYes=true` 且 `tailNoDominantYesThreshold=0.93` 表示只有当同事件中另一个桶已经明显像胜出项时，可选 `NO` 分支才会触发。
+- `tailNoTriggerPrice=0.98` 表示可选 `NO` 分支只有在观察到的 `NO` 价格已经达到 `98%+` 时才会买入。
+- `tailNoMaxOrderPrice=0.999` 会给可选 `BUY NO` 限价设一个上限，避免脚本追得过高。
+- `orderYesPrice` 是实际下单时挂出的限价。默认配置下，策略会在 YES 低于 `0.10` 时触发，但挂单价格仍然固定为 `0.10`。
+- 现在的 BUY 决策同时要求绝对价格触发和事件内相对便宜信号，而不是只看绝对 `0.10` 这一条规则。
+- 现在的触发和止盈判断会优先使用可成交的订单簿价格，也就是 BUY 看 `best ask`、SELL 看 `best bid`，而不是依赖可能滞后的 last trade。
+- `dominantYesSkipThreshold=0.9` 表示如果同一个天气事件里已经有任意选项达到 `90%+`，脚本就会跳过整个事件，不再继续下单。
+- `minTemperatureByCity` 允许你在关闭天气预报过滤时，按城市设置额外的温度桶下限。
+- 如果某个 YES token 在你的账户里已经有真实持仓，脚本会跳过它，不会重复加仓。
+- 没有 CLOB 订单簿的 token 会被静默跳过，让长期运行的日志保持可读。
+- 启动时，脚本只会打印最终纳入监控范围的 `city + date` 分组。
+- 轮询过程中，普通跳过不会刷屏；只有成功的 BUY 和成功的止盈 SELL 才会打印出来。
 
-## 5. Weather backtest
+## 5. 天气回测
 
-This script compares two things for already-closed weather events:
+这个脚本会比较已经结算的天气事件中的两件事：
 
-- the settled Polymarket winning bucket for a city/date
-- the bucket you would derive from Open-Meteo archive data
+- Polymarket 最终结算出来的 winning bucket
+- 根据 Open-Meteo 历史天气数据推导出来的 bucket
 
-This first version is a validation/reporting tool only. It does not place orders.
+当前这个版本只是一个校验和报表工具，不会真实下单。
 
-Examples:
+示例：
 
 ```bash
 npm run backtest-weather -- --date 2026-04-24 --cities Shanghai
 npm run backtest-weather -- --from 2026-04-20 --to 2026-04-24 --cities Shanghai,Beijing
 ```
 
-With Clash local proxy:
+如果需要走 Clash 本地代理：
 
 ```bash
 npm run backtest-weather:clash -- --from 2026-04-20 --to 2026-04-24 --cities Shanghai,Beijing
 ```
 
-Useful options:
+常用参数：
 
 - `--weather-category highestTemperature|lowestTemperature`
 - `--bucket-mode round|floor|ceil`
 - `--format table|json`
-- `--config config.markets.json` to reuse `allowedCities`, `weatherCategory`, `weatherForecastTimezone`, and `weatherForecastCityCoordinates`
+- `--config config.markets.json`：复用 `allowedCities`、`weatherCategory`、`weatherForecastTimezone` 和 `weatherForecastCityCoordinates`
 
-Notes:
+说明：
 
-- The script fetches closed weather events from Gamma and reads the winning bucket from settled `outcomePrices`.
-- The weather side uses Open-Meteo archive data from `archive-api.open-meteo.com`, not Polymarket's own resolution source.
-- `--bucket-mode round` means a historical temperature like `20.2°C` is mapped to bucket `20°C`; `floor` and `ceil` are available for sensitivity checks.
+- 脚本会从 Gamma 拉取已经关闭的天气事件，并从结算后的 `outcomePrices` 中读取 winning bucket。
+- 天气数据来自 `archive-api.open-meteo.com` 的历史归档接口，不是 Polymarket 自己的结算源。
+- `--bucket-mode round` 表示像 `20.2°C` 这样的历史温度会被映射到 `20°C` 桶；`floor` 和 `ceil` 可用于做敏感性对比。

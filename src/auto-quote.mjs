@@ -1,5 +1,6 @@
 import { OrderType, Side } from "@polymarket/clob-client-v2";
 import { createAuthenticatedClient } from "./polymarket-client.mjs";
+import { startHeartbeatLoop } from "./heartbeat.mjs";
 
 function printHelp() {
   console.log(`
@@ -24,6 +25,8 @@ Strategy options:
   --order-type <GTC|GTD>   Default: GTC
   --post-only <true|false> Default: true
   --dry-run                Observe and print actions, but do not cancel or place
+
+Live mode automatically sends Polymarket heartbeat requests to keep resting orders alive.
 
 Examples:
   npm run auto-quote -- --token-id 123 --side BUY --size 25
@@ -400,17 +403,22 @@ async function runLoop(client, options) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   const { client, signer, host, chainId, signatureType, funderAddress } = await createAuthenticatedClient();
+  const stopHeartbeat = options.dryRun ? null : startHeartbeatLoop(client, { label: "auto-quote" });
 
-  printConfig({
-    host,
-    chainId,
-    signatureType,
-    signerAddress: signer.address,
-    funderAddress,
-    options,
-  });
+  try {
+    printConfig({
+      host,
+      chainId,
+      signatureType,
+      signerAddress: signer.address,
+      funderAddress,
+      options,
+    });
 
-  await runLoop(client, options);
+    await runLoop(client, options);
+  } finally {
+    stopHeartbeat?.();
+  }
 }
 
 main().catch((error) => {

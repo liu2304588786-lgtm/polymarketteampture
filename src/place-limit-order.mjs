@@ -1,5 +1,6 @@
 import { OrderType, Side } from "@polymarket/clob-client-v2";
 import { createAuthenticatedClient } from "./polymarket-client.mjs";
+import { startHeartbeatLoop } from "./heartbeat.mjs";
 
 function printHelp() {
   console.log(`
@@ -26,12 +27,15 @@ Options:
   --expiration <unix>     Optional expiration timestamp
   --order-type <GTC|GTD>  Default: GTC
   --post-only <true|false> Default: true
+  --keep-alive            Keep sending heartbeats so a resting order can stay live
+  --heartbeat-ms <n>      Heartbeat interval in milliseconds. Default: 5000
   --dry-run               Create and sign the order, but do not post it
   --help                  Show this message
 
 Examples:
   npm run place-limit -- --token-id 123 --side BUY --price 0.42 --size 25
   npm run place-limit -- --token-id 123 --side SELL --price 0.67 --size 10 --post-only false
+  npm run place-limit -- --token-id 123 --side BUY --price 0.42 --size 25 --keep-alive
   npm run place-limit -- --token-id 123 --side BUY --price 0.39 --size 50 --dry-run
 `);
 }
@@ -45,6 +49,8 @@ function parseArgs(argv) {
     expiration: undefined,
     orderType: OrderType.GTC,
     postOnly: true,
+    keepAlive: false,
+    heartbeatMs: 5000,
     dryRun: false,
   };
 
@@ -93,6 +99,16 @@ function parseArgs(argv) {
 
     if (arg === "--post-only") {
       options.postOnly = parseBoolean(argv[++index], "--post-only");
+      continue;
+    }
+
+    if (arg === "--keep-alive") {
+      options.keepAlive = true;
+      continue;
+    }
+
+    if (arg === "--heartbeat-ms") {
+      options.heartbeatMs = parsePositiveInteger(argv[++index], "--heartbeat-ms");
       continue;
     }
 
@@ -175,7 +191,29 @@ function printConfigSummary(config) {
   console.log(`size: ${config.order.size}`);
   console.log(`order type: ${config.orderType}`);
   console.log(`post only: ${config.postOnly}`);
+  console.log(`keep alive: ${config.keepAlive}`);
+  console.log(`heartbeat ms: ${config.heartbeatMs}`);
   console.log(`expiration: ${config.order.expiration ?? 0}`);
+}
+
+function waitForTerminationSignal() {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const finish = (signal) => {
+      if (resolved) {
+        return;
+      }
+      resolved = true;
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+      resolve(signal);
+    };
+    const onSigint = () => finish("SIGINT");
+    const onSigterm = () => finish("SIGTERM");
+
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+  });
 }
 
 async function main() {
@@ -199,6 +237,8 @@ async function main() {
     order,
     orderType: args.orderType,
     postOnly: args.postOnly,
+    keepAlive: args.keepAlive,
+    heartbeatMs: args.heartbeatMs,
   });
 
   const [tickSize, negRisk] = await Promise.all([
@@ -231,6 +271,27 @@ async function main() {
 
   if (response?.success === false) {
     process.exitCode = 1;
+    return;
+  }
+
+  if (!args.keepAlive) {
+    console.warn(
+      "\nWarning: latest Polymarket docs say resting orders require ongoing heartbeat requests. " +
+      "Use --keep-alive if you want this one-shot script to keep the order live after posting.",
+    );
+    return;
+  }
+
+  const stopHeartbeat = startHeartbeatLoop(client, {
+    intervalMs: args.heartbeatMs,
+    label: "place-limit",
+  });
+
+  console.log("\nHeartbeat keep-alive started. Press Ctrl+C to stop and let the script exit.");
+  try {
+    await waitForTerminationSignal();
+  } finally {
+    stopHeartbeat();
   }
 }
 

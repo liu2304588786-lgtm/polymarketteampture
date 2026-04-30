@@ -64,6 +64,12 @@ npm run place-limit:clash -- --token-id <TOKEN_ID> --side BUY --price 0.42 --siz
 npm run place-limit -- --token-id <TOKEN_ID> --side BUY --price 0.42 --size 25 --dry-run
 ```
 
+如果你要让一笔 resting order 在脚本退出前持续保持有效，可以打开 heartbeat keep-alive：
+
+```bash
+npm run place-limit -- --token-id <TOKEN_ID> --side BUY --price 0.42 --size 25 --keep-alive
+```
+
 ### 关键环境变量
 
 - `PRIVATE_KEY`：签名私钥
@@ -75,6 +81,8 @@ npm run place-limit -- --token-id <TOKEN_ID> --side BUY --price 0.42 --size 25 -
 
 - 脚本会在发单前通过 SDK 自动解析 `tickSize` 和 `negRisk`。
 - 默认使用 `postOnly=true`，因此订单行为更接近静态 maker 挂单。
+- 根据 Polymarket 最新文档，resting orders 需要持续发送 heartbeat 才能保持存活；`place-limit` 如需持续保活，请使用 `--keep-alive`。
+- 根据 Polymarket 最新文档，买单前需要有足够的 `pUSD` collateral 余额和 allowance。
 - Polymarket 文档中这几个签名类型含义如下：
   `0` = EOA
   `1` = POLY_PROXY
@@ -124,6 +132,7 @@ npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks
 
 - 当前版本刻意只管理每个 `token_id + side` 下的一笔活跃订单。
 - 在重新报价前，它会先取消该 token 同侧多余的订单。
+- live 模式下脚本会自动发送 heartbeat，保证官方要求的 resting-order 保活流程持续运行。
 - 建议先从 `--dry-run` 开始，确认目标价格和换单逻辑符合预期。
 
 ## 4. Threshold buyer
@@ -137,7 +146,7 @@ npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks
 - 当观察到的 YES 概率低于 `0.10` 时，以 `0.10` 挂一笔 `BUY YES` 限价单
 - 固定下单数量为 `20` 份
 - 成功挂出买单后，脚本会为该 token 记录一份止盈计划
-- 当 YES 涨到买入价的 `2x` 时，自动对持仓的 `50%` 挂出一笔 `SELL YES`
+- 当 YES 到达固定止盈价 `0.80` 时，自动对整仓挂出一笔 `SELL YES`
 - 当 `weatherForecastFilterEnabled=true` 时，会拉取天气预报区间，只监控靠近预报高温或低温的桶
 - 所有城市都使用同一套对称规则：先把预报高温四舍五入，再监控 `±1°C`
 - 例如，预报高温是 `28.6°C`，四舍五入后为 `29°C`，那么脚本只会保留 `28°C`、`29°C`、`30°C`
@@ -229,6 +238,7 @@ npm run threshold-buyer -- --config my-markets.json
 - `tailNoOrderSize` 允许可选 `NO` 分支使用独立仓位大小，而不是与 YES 分支共用。
 - `takeProfitEnabled=true` 表示在买单挂出后，脚本会继续监控已持有的 YES 仓位是否满足止盈条件。
 - `takeProfitTargetPrice=0.8` 表示当 YES 到达 `0.80` 时，脚本会挂一笔整仓卖单。
+- live 模式下脚本会自动发送 heartbeat，保证官方要求的 resting-order 保活流程持续运行。
 - `minTriggerLiquidityShares=5` 表示只有在当前最优卖价至少展示 `5` 份深度时，才会触发 BUY。
 - `minTakeProfitLiquidityShares=5` 表示只有在当前最优买价至少展示 `5` 份深度时，才会触发止盈。
 - `maxStrategyTokensPerEvent=2` 表示每个天气事件最多同时持有 `2` 个活跃 YES token，用来降低互斥桶之间非原子执行的风险。
@@ -250,6 +260,7 @@ npm run threshold-buyer -- --config my-markets.json
 - `tailNoTriggerPrice=0.98` 表示可选 `NO` 分支只有在观察到的 `NO` 价格已经达到 `98%+` 时才会买入。
 - `tailNoMaxOrderPrice=0.999` 会给可选 `BUY NO` 限价设一个上限，避免脚本追得过高。
 - `orderYesPrice` 是实际下单时挂出的限价。默认配置下，策略会在 YES 低于 `0.10` 时触发，但挂单价格仍然固定为 `0.10`。
+- 资金检查和日志现在按最新文档口径使用 `pUSD/collateral` 表述，不再写死成旧的 `USDC` 文案。
 - 现在的 BUY 决策同时要求绝对价格触发和事件内相对便宜信号，而不是只看绝对 `0.10` 这一条规则。
 - 现在的触发和止盈判断会优先使用可成交的订单簿价格，也就是 BUY 看 `best ask`、SELL 看 `best bid`，而不是依赖可能滞后的 last trade。
 - `dominantYesSkipThreshold=0.9` 表示如果同一个天气事件里已经有任意选项达到 `90%+`，脚本就会跳过整个事件，不再继续下单。

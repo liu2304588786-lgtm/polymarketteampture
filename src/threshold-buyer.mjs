@@ -3,6 +3,7 @@ import path from "node:path";
 import axios from "axios";
 import { OrderType, Side } from "@polymarket/clob-client-v2";
 import { createAuthenticatedClient } from "./polymarket-client.mjs";
+import { startHeartbeatLoop } from "./heartbeat.mjs";
 
 const GAMMA_BASE_URL = "https://gamma-api.polymarket.com";
 const DATA_API_BASE_URL = "https://data-api.polymarket.com";
@@ -113,6 +114,8 @@ Usage:
 
 Config file:
   By default the script reads ./config.markets.json
+
+Live mode automatically sends Polymarket heartbeat requests to keep resting orders alive.
 
 Top-level config fields:
   pollIntervalMs             Loop interval in milliseconds
@@ -256,7 +259,7 @@ function toBigInt(value) {
   }
 }
 
-function formatUsdcFromMicros(value) {
+function formatCollateralFromMicros(value) {
   const micros = toBigInt(value);
   if (micros === null) {
     return "n/a";
@@ -344,11 +347,12 @@ function getRequiredOrderAmountMicros(orderPrice, orderSize) {
 
 function buildCollateralStatus(response) {
   const balanceMicros = toBigInt(response?.balance);
-  const allowanceValues = Object.values(
-    response?.allowances && typeof response.allowances === "object" ? response.allowances : {},
-  )
-    .map((value) => toBigInt(value))
-    .filter((value) => value !== null);
+  const allowanceValues = [
+    toBigInt(response?.allowance),
+    ...Object.values(response?.allowances && typeof response.allowances === "object" ? response.allowances : {}).map(
+      (value) => toBigInt(value),
+    ),
+  ].filter((value) => value !== null);
 
   const maxAllowanceMicros =
     allowanceValues.length === 0
@@ -381,7 +385,10 @@ function buildTradeBlockReason(collateralStatus, config, watchItem, referencePri
     requiredMicros,
     balanceMicros,
     maxAllowanceMicros,
-    message: `余额/授权不足（余额 ${formatUsdcFromMicros(balanceMicros)} USDC，授权 ${formatUsdcFromMicros(maxAllowanceMicros)} USDC，本单需 ${formatUsdcFromMicros(requiredMicros)} USDC）`,
+    message:
+      `余额/授权不足（pUSD/collateral 余额 ${formatCollateralFromMicros(balanceMicros)}，` +
+      `授权 ${formatCollateralFromMicros(maxAllowanceMicros)}，` +
+      `本单需 ${formatCollateralFromMicros(requiredMicros)}）`,
   };
 }
 
@@ -2822,40 +2829,45 @@ async function main() {
   console.log("Authenticating Polymarket client...");
   process.env.POLYMARKET_QUIET_AUTH = "1";
   const clientContext = await createAuthenticatedClient();
+  const stopHeartbeat = config.dryRun ? null : startHeartbeatLoop(clientContext.client, { label: "threshold-buyer" });
   console.log("Resolving configured markets...");
-  const watchItems = await resolveConfiguredMarkets(config);
+  try {
+    const watchItems = await resolveConfiguredMarkets(config);
 
-  if (watchItems.length === 0) {
-    throw new Error("没有解析到可监控的 YES 市场，请检查配置或自动发现规则。");
-  }
+    if (watchItems.length === 0) {
+      throw new Error("没有解析到可监控的 YES 市场，请检查配置或自动发现规则。");
+    }
 
-  console.log(`Resolved ${watchItems.length} YES markets.`);
-  summarizeMonitoringRanges(watchItems);
+    console.log(`Resolved ${watchItems.length} YES markets.`);
+    summarizeMonitoringRanges(watchItems);
 
-  while (true) {
-    let stateChanged = false;
-    const runtimeContext = await buildRuntimeContext(clientContext, watchItems, config);
+    while (true) {
+      let stateChanged = false;
+      const runtimeContext = await buildRuntimeContext(clientContext, watchItems, config);
 
-    for (const watchItem of watchItems) {
-      try {
-        const changed = await evaluateWatchItem(
-          clientContext.client,
-          config,
-          state,
-          watchItem,
-          runtimeContext,
-        );
-        stateChanged = stateChanged || changed;
-      } catch (error) {
-        void error;
+      for (const watchItem of watchItems) {
+        try {
+          const changed = await evaluateWatchItem(
+            clientContext.client,
+            config,
+            state,
+            watchItem,
+            runtimeContext,
+          );
+          stateChanged = stateChanged || changed;
+        } catch (error) {
+          void error;
+        }
       }
-    }
 
-    if (stateChanged && !config.dryRun) {
-      await saveState(statePath, state);
-    }
+      if (stateChanged && !config.dryRun) {
+        await saveState(statePath, state);
+      }
 
-    await sleep(config.pollIntervalMs);
+      await sleep(config.pollIntervalMs);
+    }
+  } finally {
+    stopHeartbeat?.();
   }
 }
 

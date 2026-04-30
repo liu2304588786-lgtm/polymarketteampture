@@ -8,12 +8,14 @@ import { startHeartbeatLoop } from "./heartbeat.mjs";
 const GAMMA_BASE_URL = "https://gamma-api.polymarket.com";
 const DATA_API_BASE_URL = "https://data-api.polymarket.com";
 const OPEN_METEO_BASE_URL = "https://api.open-meteo.com";
+const OPEN_METEO_GEOCODING_BASE_URL = "https://geocoding-api.open-meteo.com";
 const DEFAULT_CONFIG_PATH = "config.markets.json";
 const NO_ORDERBOOK_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const TRANSIENT_ORDERBOOK_LOG_INTERVAL_MS = 5 * 60 * 1000;
 const THIN_LIQUIDITY_SKIP_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const EVENT_EXPOSURE_SKIP_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const RELATIVE_VALUE_SKIP_LOG_INTERVAL_MS = 30 * 60 * 1000;
+const SIZING_SKIP_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const POSITION_SKIP_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const DOMINANT_EVENT_SKIP_LOG_INTERVAL_MS = 30 * 60 * 1000;
 const INSUFFICIENT_COLLATERAL_LOG_INTERVAL_MS = 60 * 1000;
@@ -23,11 +25,9 @@ const FETCH_JSON_RETRY_BASE_DELAY_MS = 750;
 const ORDERBOOK_MAX_ATTEMPTS = 3;
 const ORDERBOOK_RETRY_BASE_DELAY_MS = 500;
 const USDC_MICROS_PER_UNIT = 1_000_000n;
-const DEFAULT_ALLOWED_CITIES = ["Shenzhen", "Shanghai", "Beijing", "Hong Kong", "Guangzhou", "Taipei"];
-const DEFAULT_MIN_TEMPERATURE_BY_CITY = {
-  Shenzhen: 29,
-  "Hong Kong": 29,
-};
+const ALL_CITIES_SENTINEL = "*";
+const DEFAULT_ALLOWED_CITIES = [ALL_CITIES_SENTINEL];
+const DEFAULT_MIN_TEMPERATURE_BY_CITY = {};
 const DEFAULT_WEATHER_FORECAST_PROVIDER = "open-meteo";
 const DEFAULT_WEATHER_FORECAST_TIMEZONE = "Asia/Shanghai";
 const DEFAULT_WEATHER_FORECAST_WINDOW_C = 1;
@@ -37,6 +37,12 @@ const DEFAULT_TAIL_NO_MAX_ORDER_PRICE = 0.999;
 const DEFAULT_TAIL_NO_MIN_BUCKET_GAP_C = 2;
 const DEFAULT_TAIL_NO_MAX_DAYS_AHEAD = 0;
 const DEFAULT_TAIL_NO_DOMINANT_YES_THRESHOLD = 0.93;
+const DEFAULT_DYNAMIC_ORDER_SIZING_ENABLED = true;
+const DEFAULT_DYNAMIC_ORDER_SIZING_MIN_SHARES = 3;
+const DEFAULT_DYNAMIC_ORDER_SIZING_MIN_BALANCE_FRACTION = 0.01;
+const DEFAULT_DYNAMIC_ORDER_SIZING_MAX_BALANCE_FRACTION = 0.04;
+const DEFAULT_DYNAMIC_ORDER_SIZING_TOP_LEVEL_DEPTH_FRACTION = 0.9;
+const DEFAULT_DYNAMIC_ORDER_SIZING_MIN_QUALITY_SCORE = 0.35;
 const DEFAULT_WEATHER_FORECAST_CITY_COORDINATES = {
   shenzhen: { latitude: 22.5431, longitude: 114.0579 },
   shanghai: { latitude: 31.2304, longitude: 121.4737 },
@@ -136,7 +142,7 @@ Top-level config fields:
   dryRun                     true | false
   stateFile                  Local JSON state file for deduping
   autoDiscoverWeatherMarkets true | false
-  allowedCities              Cities to auto-discover
+  allowedCities              Cities to auto-discover, or ["*"] for all cities
   weatherCategory            highestTemperature | lowestTemperature | any
   dominantYesSkipThreshold   Skip whole event when any YES outcome reaches this probability
   weatherForecastFilterEnabled true | false, filter buckets by forecast high/low temperature window
@@ -153,6 +159,14 @@ Top-level config fields:
   tailNoMaxDaysAhead         Maximum whole days ahead allowed for BUY NO
   tailNoRequireDominantYes   true | false, require another bucket to already dominate
   tailNoDominantYesThreshold Minimum YES price required for dominant-bucket confirmation
+  dynamicOrderSizingEnabled  true | false, size entries from balance, quality, and top-of-book depth
+  dynamicOrderSizingMinShares Minimum dynamic entry size in shares
+  dynamicOrderSizingMaxShares Maximum YES entry size when conviction and balance are strong
+  dynamicOrderSizingTailNoMaxShares Maximum Tail-NO entry size when conviction and balance are strong
+  dynamicOrderSizingMinBalanceFraction Minimum balance fraction allocated to one entry
+  dynamicOrderSizingMaxBalanceFraction Maximum balance fraction allocated to one entry
+  dynamicOrderSizingTopLevelDepthFraction Max fraction of best-ask displayed depth to consume
+  dynamicOrderSizingMinQualityScore Minimum signal quality score required to open a trade
   minTemperatureByCity       Optional per-city temperature floor
   targets                    Optional array of { url } or { name } or { slug }
 `);
@@ -234,6 +248,45 @@ function normalizeText(value) {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function titleCaseWords(value) {
+  return String(value || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function createDynamicCityKey(value) {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized.replace(/\s+/g, "-");
+}
+
+function isAllCitiesSelection(cities) {
+  return Array.isArray(cities) && cities.includes(ALL_CITIES_SENTINEL);
+}
+
+function citySelectionIncludes(cities, cityKey) {
+  return isAllCitiesSelection(cities) || cities.includes(cityKey);
+}
+
+function clampNumber(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function celsiusToFahrenheit(value) {
+  const parsed = toNumber(value);
+  return parsed === null ? null : (parsed * 9) / 5 + 32;
+}
+
+function fahrenheitToCelsius(value) {
+  const parsed = toNumber(value);
+  return parsed === null ? null : ((parsed - 32) * 5) / 9;
 }
 
 function startOfDay(date) {
@@ -366,13 +419,162 @@ function buildCollateralStatus(response) {
   };
 }
 
-function buildTradeBlockReason(collateralStatus, config, watchItem, referencePrice) {
-  if (!collateralStatus) {
+function getCollateralUnits(balanceMicros) {
+  if (balanceMicros === null || balanceMicros === undefined) {
     return null;
   }
 
+  return Number(balanceMicros) / Number(USDC_MICROS_PER_UNIT);
+}
+
+function computeForecastAlignmentScore(watchItem) {
+  const forecastBasisC = toNumber(watchItem?.weatherForecast?.basisC);
+  const bucketCenterC = toNumber(watchItem?.temperatureBucket?.centerC);
+  if (forecastBasisC === null || bucketCenterC === null) {
+    return 0.5;
+  }
+
+  const maxDistance = Math.max(toNumber(watchItem?.weatherForecast?.windowC) ?? 1, 1);
+  return clampNumber(1 - Math.abs(bucketCenterC - forecastBasisC) / maxDistance, 0, 1);
+}
+
+function computeYesEntryQualityScore(config, watchItem, referencePrice, relativeAssessment) {
+  const priceScore = clampNumber(
+    (config.triggerYesPrice - referencePrice) / Math.max(config.triggerYesPrice, 0.01),
+    0,
+    1,
+  );
+  const discountScore = relativeAssessment
+    ? clampNumber(
+        relativeAssessment.relativeDiscount / Math.max(config.relativeMispricingMinDiscount * 2, 0.02),
+        0,
+        1,
+      )
+    : 0.5;
+  const rankScore = relativeAssessment
+    ? clampNumber(
+        (config.relativeMispricingMaxPriceRank - relativeAssessment.priceRank + 1) /
+          Math.max(config.relativeMispricingMaxPriceRank, 1),
+        0,
+        1,
+      )
+    : 0.5;
+  const forecastScore = computeForecastAlignmentScore(watchItem);
+
+  return Number((priceScore * 0.4 + discountScore * 0.25 + rankScore * 0.15 + forecastScore * 0.2).toFixed(4));
+}
+
+function computeTailNoEntryQualityScore(config, watchItem, referencePrice, eventSnapshot) {
+  const priceDenominator = Math.max(config.tailNoMaxOrderPrice - config.tailNoTriggerPrice, 0.01);
+  const priceScore = clampNumber((referencePrice - config.tailNoTriggerPrice) / priceDenominator, 0, 1);
+  const forecastGapC = toNumber(watchItem?.forecastGapC) ?? 0;
+  const gapScore = clampNumber(
+    (forecastGapC - config.tailNoMinBucketGapC + 1) / Math.max(config.weatherForecastWindowC + 1, 1),
+    0,
+    1,
+  );
+  const dominantScore = config.tailNoRequireDominantYes
+    ? clampNumber(
+        ((eventSnapshot?.highestYesPrice ?? 0) - config.tailNoDominantYesThreshold) /
+          Math.max(1 - config.tailNoDominantYesThreshold, 0.01),
+        0,
+        1,
+      )
+    : 0.5;
+  const daysAhead = Math.max(getDaysUntilWatchItemDate(watchItem), 0);
+  const timeScore = clampNumber(1 - daysAhead / Math.max(config.tailNoMaxDaysAhead + 1, 1), 0, 1);
+
+  return Number((priceScore * 0.4 + gapScore * 0.2 + dominantScore * 0.3 + timeScore * 0.1).toFixed(4));
+}
+
+function computeEntryQualityScore(config, watchItem, referencePrice, relativeAssessment, eventSnapshot) {
+  if (isTailNoWatchItem(watchItem)) {
+    return computeTailNoEntryQualityScore(config, watchItem, referencePrice, eventSnapshot);
+  }
+
+  return computeYesEntryQualityScore(config, watchItem, referencePrice, relativeAssessment);
+}
+
+function getStaticEntryOrderSize(config, watchItem) {
+  return isTailNoWatchItem(watchItem) ? config.tailNoOrderSize : config.orderSize;
+}
+
+function getDynamicEntryMaxShares(config, watchItem) {
+  return isTailNoWatchItem(watchItem)
+    ? config.dynamicOrderSizingTailNoMaxShares
+    : config.dynamicOrderSizingMaxShares;
+}
+
+function buildEntryPlan(
+  config,
+  watchItem,
+  collateralStatus,
+  referencePrice,
+  relativeAssessment,
+  eventSnapshot,
+  bestAskSize,
+) {
   const orderPrice = getEntryOrderPrice(config, watchItem, referencePrice);
-  const orderSize = getEntryOrderSize(config, watchItem);
+  const qualityScore = computeEntryQualityScore(config, watchItem, referencePrice, relativeAssessment, eventSnapshot);
+  const baseShares = getStaticEntryOrderSize(config, watchItem);
+
+  if (!config.dynamicOrderSizingEnabled) {
+    return {
+      orderPrice,
+      orderSize: baseShares,
+      qualityScore,
+      skipReason: null,
+    };
+  }
+
+  if (qualityScore < config.dynamicOrderSizingMinQualityScore) {
+    return {
+      orderPrice,
+      orderSize: 0,
+      qualityScore,
+      skipReason: `信号质量 ${qualityScore.toFixed(2)} 低于最小要求 ${config.dynamicOrderSizingMinQualityScore.toFixed(2)}`,
+    };
+  }
+
+  const dynamicMaxShares = Math.max(baseShares, getDynamicEntryMaxShares(config, watchItem));
+  const targetSharesByQuality = baseShares + qualityScore * (dynamicMaxShares - baseShares);
+  const targetBalanceFraction =
+    config.dynamicOrderSizingMinBalanceFraction +
+    qualityScore * (config.dynamicOrderSizingMaxBalanceFraction - config.dynamicOrderSizingMinBalanceFraction);
+  const collateralUnits = getCollateralUnits(collateralStatus?.balanceMicros);
+  const sharesByBalance =
+    collateralUnits === null ? Number.POSITIVE_INFINITY : (collateralUnits * targetBalanceFraction) / orderPrice;
+  const sharesByDepth =
+    bestAskSize === null
+      ? Number.POSITIVE_INFINITY
+      : bestAskSize * config.dynamicOrderSizingTopLevelDepthFraction;
+
+  const computedShares = Math.min(targetSharesByQuality, sharesByBalance, sharesByDepth);
+  const orderSize = roundShareSize(computedShares);
+
+  if (orderSize < config.dynamicOrderSizingMinShares) {
+    return {
+      orderPrice,
+      orderSize,
+      qualityScore,
+      skipReason:
+        `动态仓位 ${orderSize.toFixed(4)} 份过小；余额、盘口深度或信号质量不足以支撑最小仓位 ${config.dynamicOrderSizingMinShares}`,
+    };
+  }
+
+  return {
+    orderPrice,
+    orderSize,
+    qualityScore,
+    skipReason: null,
+  };
+}
+
+function buildTradeBlockReason(collateralStatus, orderPrice, orderSize) {
+  if (!collateralStatus || orderSize <= 0) {
+    return null;
+  }
+
   const requiredMicros = getRequiredOrderAmountMicros(orderPrice, orderSize);
   const balanceMicros = collateralStatus.balanceMicros ?? 0n;
   const maxAllowanceMicros = collateralStatus.maxAllowanceMicros ?? 0n;
@@ -486,28 +688,57 @@ function findCityDefinition(value) {
   );
 }
 
+function normalizeCityKey(value) {
+  if (value === ALL_CITIES_SENTINEL) {
+    return ALL_CITIES_SENTINEL;
+  }
+
+  const definition = findCityDefinition(value);
+  if (definition) {
+    return definition.key;
+  }
+
+  return createDynamicCityKey(value);
+}
+
 function getCityDisplayLabel(cityKey) {
-  return findCityDefinition(cityKey)?.label ?? String(cityKey || "");
+  if (cityKey === ALL_CITIES_SENTINEL) {
+    return "All Cities";
+  }
+
+  return findCityDefinition(cityKey)?.label ?? titleCaseWords(String(cityKey || "").replace(/-/g, " "));
 }
 
 function getCityLogLabel(cityKey) {
+  if (cityKey === ALL_CITIES_SENTINEL) {
+    return "全部城市";
+  }
+
   const definition = findCityDefinition(cityKey);
-  return definition?.zhLabel ?? definition?.label ?? String(cityKey || "");
+  return definition?.zhLabel ?? definition?.label ?? titleCaseWords(String(cityKey || "").replace(/-/g, " "));
 }
 
 function getCityAliases(cityKey) {
+  if (cityKey === ALL_CITIES_SENTINEL) {
+    return [ALL_CITIES_SENTINEL];
+  }
+
   const definition = findCityDefinition(cityKey);
   if (!definition) {
-    return [String(cityKey || "")];
+    return [getCityDisplayLabel(cityKey)];
   }
 
   return [definition.key, definition.label, ...definition.aliases];
 }
 
 function getCitySearchAlias(cityKey) {
+  if (cityKey === ALL_CITIES_SENTINEL) {
+    return "";
+  }
+
   const definition = findCityDefinition(cityKey);
   if (!definition) {
-    return String(cityKey || "");
+    return getCityDisplayLabel(cityKey);
   }
 
   return definition.aliases.find((alias) => /^[a-z ]+$/i.test(alias)) ?? definition.aliases[0];
@@ -527,8 +758,17 @@ function normalizeAllowedCities(value, fieldName = "allowedCities") {
       throw new Error(`${fieldName} entries must be non-empty strings.`);
     }
 
-    const definition = findCityDefinition(cityValue);
-    const canonicalKey = definition?.key ?? cityValue;
+    const normalizedValue = normalizeText(cityValue);
+    if (
+      cityValue === ALL_CITIES_SENTINEL ||
+      normalizedValue === "all" ||
+      normalizedValue === "all cities" ||
+      normalizedValue === "全部城市"
+    ) {
+      return [ALL_CITIES_SENTINEL];
+    }
+
+    const canonicalKey = normalizeCityKey(cityValue);
     if (!seen.has(canonicalKey)) {
       seen.add(canonicalKey);
       normalizedCities.push(canonicalKey);
@@ -539,6 +779,10 @@ function normalizeAllowedCities(value, fieldName = "allowedCities") {
 }
 
 function mergeUniqueCities(...cityGroups) {
+  if (cityGroups.some((group) => isAllCitiesSelection(group))) {
+    return [ALL_CITIES_SENTINEL];
+  }
+
   const merged = [];
   const seen = new Set();
 
@@ -610,6 +854,7 @@ function normalizeTarget(target, index) {
 
 function normalizeMinTemperatureByCity(value, allowedCities) {
   const shouldUseDefaults = value === undefined || value === null;
+  const monitorAllCities = isAllCitiesSelection(allowedCities);
 
   if (value === undefined || value === null) {
     value = DEFAULT_MIN_TEMPERATURE_BY_CITY;
@@ -621,8 +866,7 @@ function normalizeMinTemperatureByCity(value, allowedCities) {
 
   const normalized = {};
   for (const [rawCity, rawTemperature] of Object.entries(value)) {
-    const definition = findCityDefinition(rawCity);
-    const canonicalKey = definition?.key ?? rawCity;
+    const canonicalKey = normalizeCityKey(rawCity);
     const parsedTemperature = Number.parseInt(rawTemperature, 10);
     if (!Number.isInteger(parsedTemperature) || parsedTemperature <= 0) {
       throw new Error(`minTemperatureByCity.${rawCity} must be a positive integer.`);
@@ -631,7 +875,7 @@ function normalizeMinTemperatureByCity(value, allowedCities) {
     normalized[canonicalKey] = parsedTemperature;
   }
 
-  if (shouldUseDefaults) {
+  if (shouldUseDefaults && !monitorAllCities) {
     for (const city of allowedCities) {
       if (normalized[city] === undefined && DEFAULT_MIN_TEMPERATURE_BY_CITY[getCitySearchAlias(city)]) {
         normalized[city] = DEFAULT_MIN_TEMPERATURE_BY_CITY[getCitySearchAlias(city)];
@@ -655,8 +899,13 @@ function normalizeMinTemperatureByCity(value, allowedCities) {
 
 function normalizeWeatherForecastCityCoordinates(value, allowedCities) {
   const normalized = {};
+  const monitorAllCities = isAllCitiesSelection(allowedCities);
 
   for (const cityKey of allowedCities) {
+    if (cityKey === ALL_CITIES_SENTINEL) {
+      continue;
+    }
+
     const defaults = DEFAULT_WEATHER_FORECAST_CITY_COORDINATES[cityKey];
     if (defaults) {
       normalized[cityKey] = { ...defaults };
@@ -672,9 +921,8 @@ function normalizeWeatherForecastCityCoordinates(value, allowedCities) {
   }
 
   for (const [rawCity, rawCoordinates] of Object.entries(value)) {
-    const definition = findCityDefinition(rawCity);
-    const canonicalKey = definition?.key ?? rawCity;
-    if (!allowedCities.includes(canonicalKey)) {
+    const canonicalKey = normalizeCityKey(rawCity);
+    if (!monitorAllCities && !allowedCities.includes(canonicalKey)) {
       continue;
     }
 
@@ -708,6 +956,7 @@ function normalizeConfig(rawConfig, cliOptions) {
     allowedCities,
     rawConfig.tailNoStrategyEnabled ?? false ? tailNoAllowedCities : [],
   );
+  const monitorAllCities = isAllCitiesSelection(monitoredCities);
 
   const config = {
     pollIntervalMs: positiveInteger(rawConfig.pollIntervalMs ?? 10000, "pollIntervalMs"),
@@ -749,6 +998,7 @@ function normalizeConfig(rawConfig, cliOptions) {
     allowedCities,
     tailNoAllowedCities,
     monitoredCities,
+    monitorAllCities,
     weatherCategory: normalizeWeatherCategory(rawConfig.weatherCategory ?? "highestTemperature"),
     dominantYesSkipThreshold: positiveNumber(
       rawConfig.dominantYesSkipThreshold ?? 0.9,
@@ -799,6 +1049,38 @@ function normalizeConfig(rawConfig, cliOptions) {
       rawConfig.tailNoDominantYesThreshold ?? DEFAULT_TAIL_NO_DOMINANT_YES_THRESHOLD,
       "tailNoDominantYesThreshold",
     ),
+    dynamicOrderSizingEnabled: Boolean(
+      rawConfig.dynamicOrderSizingEnabled ?? DEFAULT_DYNAMIC_ORDER_SIZING_ENABLED
+    ),
+    dynamicOrderSizingMinShares: positiveNumber(
+      rawConfig.dynamicOrderSizingMinShares ?? DEFAULT_DYNAMIC_ORDER_SIZING_MIN_SHARES,
+      "dynamicOrderSizingMinShares",
+    ),
+    dynamicOrderSizingMaxShares: positiveNumber(
+      rawConfig.dynamicOrderSizingMaxShares ?? Math.max((rawConfig.orderSize ?? 20) * 2, rawConfig.orderSize ?? 20),
+      "dynamicOrderSizingMaxShares",
+    ),
+    dynamicOrderSizingTailNoMaxShares: positiveNumber(
+      rawConfig.dynamicOrderSizingTailNoMaxShares ??
+        Math.max(rawConfig.tailNoOrderSize ?? rawConfig.orderSize ?? 20, rawConfig.tailNoOrderSize ?? rawConfig.orderSize ?? 20),
+      "dynamicOrderSizingTailNoMaxShares",
+    ),
+    dynamicOrderSizingMinBalanceFraction: zeroToOneNumber(
+      rawConfig.dynamicOrderSizingMinBalanceFraction ?? DEFAULT_DYNAMIC_ORDER_SIZING_MIN_BALANCE_FRACTION,
+      "dynamicOrderSizingMinBalanceFraction",
+    ),
+    dynamicOrderSizingMaxBalanceFraction: zeroToOneNumber(
+      rawConfig.dynamicOrderSizingMaxBalanceFraction ?? DEFAULT_DYNAMIC_ORDER_SIZING_MAX_BALANCE_FRACTION,
+      "dynamicOrderSizingMaxBalanceFraction",
+    ),
+    dynamicOrderSizingTopLevelDepthFraction: zeroToOneNumber(
+      rawConfig.dynamicOrderSizingTopLevelDepthFraction ?? DEFAULT_DYNAMIC_ORDER_SIZING_TOP_LEVEL_DEPTH_FRACTION,
+      "dynamicOrderSizingTopLevelDepthFraction",
+    ),
+    dynamicOrderSizingMinQualityScore: zeroToOneNumber(
+      rawConfig.dynamicOrderSizingMinQualityScore ?? DEFAULT_DYNAMIC_ORDER_SIZING_MIN_QUALITY_SCORE,
+      "dynamicOrderSizingMinQualityScore",
+    ),
     weatherForecastCityCoordinates: normalizeWeatherForecastCityCoordinates(
       rawConfig.weatherForecastCityCoordinates,
       monitoredCities,
@@ -813,6 +1095,10 @@ function normalizeConfig(rawConfig, cliOptions) {
 
   if (config.tailNoMaxOrderPrice < config.tailNoTriggerPrice) {
     throw new Error("tailNoMaxOrderPrice must be greater than or equal to tailNoTriggerPrice.");
+  }
+
+  if (config.dynamicOrderSizingMinBalanceFraction > config.dynamicOrderSizingMaxBalanceFraction) {
+    throw new Error("dynamicOrderSizingMinBalanceFraction must be less than or equal to dynamicOrderSizingMaxBalanceFraction.");
   }
 
   return config;
@@ -938,6 +1224,16 @@ function buildOpenMeteoUrl(pathname, params = {}) {
   return url;
 }
 
+function buildOpenMeteoGeocodingUrl(pathname, params = {}) {
+  const url = new URL(pathname, OPEN_METEO_GEOCODING_BASE_URL);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url;
+}
+
 function extractSlugFromUrl(urlString) {
   const parsed = new URL(urlString);
   const segments = parsed.pathname.split("/").filter(Boolean);
@@ -1052,59 +1348,190 @@ function matchesWeatherCategory(event, weatherCategory) {
   return false;
 }
 
-function inferCityKeyFromText(value) {
-  const combined = normalizeText(value);
-  for (const definition of CITY_DEFINITIONS) {
-    if (
-      [definition.key, definition.label, ...definition.aliases].some((alias) => {
-        const normalizedAlias = normalizeText(alias);
-        return normalizedAlias ? combined.includes(normalizedAlias) : false;
-      })
-    ) {
-      return definition.key;
+function cleanupExtractedCityLabel(value) {
+  return String(value || "")
+    .replace(/[?？]+$/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractWeatherCityLabel(value) {
+  const rawValue = String(value || "").trim();
+  if (!rawValue) {
+    return null;
+  }
+
+  const titlePatterns = [
+    /(?:highest|lowest|max|min)\s+temperature\s+in\s+(.+?)\s+on\b/i,
+    /(?:highest|lowest|max|min)\s+temperature\s+for\s+(.+?)\s+on\b/i,
+  ];
+
+  for (const pattern of titlePatterns) {
+    const match = rawValue.match(pattern);
+    if (match?.[1]) {
+      return cleanupExtractedCityLabel(match[1]);
+    }
+  }
+
+  const slugMatch = rawValue.match(
+    /(?:highest|lowest|max|min)-temperature-in-(.+?)-on-(?:january|february|march|april|may|june|july|august|september|october|november|december|\d{4}-\d{2}-\d{2})/i,
+  );
+  if (slugMatch?.[1]) {
+    return cleanupExtractedCityLabel(slugMatch[1].replace(/-/g, " "));
+  }
+
+  return null;
+}
+
+function inferCityDescriptorFromText(...values) {
+  for (const value of values) {
+    const combined = normalizeText(value);
+    if (!combined) {
+      continue;
+    }
+
+    const knownDefinition =
+      CITY_DEFINITIONS.find((definition) => {
+        return [definition.key, definition.label, ...definition.aliases].some((alias) => {
+          const normalizedAlias = normalizeText(alias);
+          return normalizedAlias ? combined.includes(normalizedAlias) : false;
+        });
+      }) ?? null;
+    if (knownDefinition) {
+      return {
+        cityKey: knownDefinition.key,
+        cityLabel: knownDefinition.label,
+      };
+    }
+
+    const extractedLabel = extractWeatherCityLabel(value);
+    if (!extractedLabel) {
+      continue;
+    }
+
+    const extractedDefinition = findCityDefinition(extractedLabel);
+    if (extractedDefinition) {
+      return {
+        cityKey: extractedDefinition.key,
+        cityLabel: extractedDefinition.label,
+      };
+    }
+
+    const dynamicKey = createDynamicCityKey(extractedLabel);
+    if (dynamicKey) {
+      return {
+        cityKey: dynamicKey,
+        cityLabel: titleCaseWords(extractedLabel),
+      };
     }
   }
 
   return null;
 }
 
+function inferCityKeyFromText(value) {
+  return inferCityDescriptorFromText(value)?.cityKey ?? null;
+}
+
 function matchesAllowedCity(event, allowedCities) {
+  if (isAllCitiesSelection(allowedCities)) {
+    return inferCityKeyFromText(`${event?.title || ""} ${event?.slug || ""}`) !== null;
+  }
+
   const cityKey = inferCityKeyFromText(`${event?.title || ""} ${event?.slug || ""}`);
-  return cityKey ? allowedCities.includes(cityKey) : false;
+  return cityKey ? citySelectionIncludes(allowedCities, cityKey) : false;
+}
+
+function buildTemperatureBucket({ kind, unit, value = null, lowerValue = null, upperValue = null }) {
+  const normalizedUnit = String(unit || "C").toUpperCase();
+  const convertToCelsius = normalizedUnit === "F" ? fahrenheitToCelsius : toNumber;
+
+  const numericValue = value === null ? null : Number(value);
+  const numericLowerValue = lowerValue === null ? null : Number(lowerValue);
+  const numericUpperValue = upperValue === null ? null : Number(upperValue);
+
+  let label = "unknown";
+  if (kind === "range") {
+    label = `${numericLowerValue}-${numericUpperValue}°${normalizedUnit}`;
+  } else if (kind === "exact") {
+    label = `${numericValue}°${normalizedUnit}`;
+  } else if (kind === "gte") {
+    label = `${numericValue}°${normalizedUnit}+`;
+  } else if (kind === "lte") {
+    label = `<=${numericValue}°${normalizedUnit}`;
+  }
+
+  let lowerC = null;
+  let upperC = null;
+  if (kind === "range") {
+    lowerC = convertToCelsius(numericLowerValue);
+    upperC = convertToCelsius(numericUpperValue);
+  } else if (kind === "exact") {
+    lowerC = convertToCelsius(numericValue);
+    upperC = convertToCelsius(numericValue);
+  } else if (kind === "gte") {
+    lowerC = convertToCelsius(numericValue);
+  } else if (kind === "lte") {
+    upperC = convertToCelsius(numericValue);
+  }
+
+  const centerC =
+    lowerC !== null && upperC !== null
+      ? Number(((lowerC + upperC) / 2).toFixed(4))
+      : lowerC ?? upperC;
+
+  return {
+    kind,
+    unit: normalizedUnit,
+    value: numericValue,
+    lowerValue: numericLowerValue,
+    upperValue: numericUpperValue,
+    lowerC,
+    upperC,
+    centerC,
+    label,
+  };
 }
 
 function parseTemperatureBucketFromText(value) {
   const rawValue = String(value || "");
-  const normalized = normalizeText(rawValue);
+  const normalizedRawValue = rawValue.replace(/[–—]/g, "-");
 
-  let match = normalized.match(/\b(\d{1,2})\s*c\s*or\s*below\b/);
+  let match = normalizedRawValue.match(/(\d{1,3})\s*-\s*(\d{1,3})\s*(?:°|º|˚)?\s*([CF])/i);
   if (match) {
-    return { kind: "lte", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "range",
+      unit: match[3],
+      lowerValue: Number.parseInt(match[1], 10),
+      upperValue: Number.parseInt(match[2], 10),
+    });
   }
 
-  match = normalized.match(/\b(\d{1,2})\s*c\s*or\s*higher\b/);
+  match = normalizedRawValue.match(/(\d{1,3})\s*(?:°|º|˚)?\s*([CF])\s*or\s*below/i);
   if (match) {
-    return { kind: "gte", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "lte",
+      unit: match[2],
+      value: Number.parseInt(match[1], 10),
+    });
   }
 
-  match = normalized.match(/\b(\d{1,2})\s*c\b/);
+  match = normalizedRawValue.match(/(\d{1,3})\s*(?:°|º|˚)?\s*([CF])\s*or\s*higher/i);
   if (match) {
-    return { kind: "exact", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "gte",
+      unit: match[2],
+      value: Number.parseInt(match[1], 10),
+    });
   }
 
-  match = rawValue.match(/(\d{1,2})\s*(?:°|º|˚)?\s*C\s*or\s*below/i);
+  match = normalizedRawValue.match(/(\d{1,3})\s*(?:°|º|˚)?\s*([CF])\b/i);
   if (match) {
-    return { kind: "lte", value: Number.parseInt(match[1], 10) };
-  }
-
-  match = rawValue.match(/(\d{1,2})\s*(?:°|º|˚)?\s*C\s*or\s*higher/i);
-  if (match) {
-    return { kind: "gte", value: Number.parseInt(match[1], 10) };
-  }
-
-  match = rawValue.match(/(\d{1,2})\s*(?:°|º|˚)?\s*C/i);
-  if (match) {
-    return { kind: "exact", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "exact",
+      unit: match[2],
+      value: Number.parseInt(match[1], 10),
+    });
   }
 
   return null;
@@ -1121,19 +1548,41 @@ function parseTemperatureBucket(market) {
   }
 
   const slug = String(market?.slug || "");
-  let match = slug.match(/-(\d{1,2})corbelow$/i);
+  let match = slug.match(/-(\d{1,3})(?:-|to)(\d{1,3})([cf])$/i);
   if (match) {
-    return { kind: "lte", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "range",
+      unit: match[3],
+      lowerValue: Number.parseInt(match[1], 10),
+      upperValue: Number.parseInt(match[2], 10),
+    });
   }
 
-  match = slug.match(/-(\d{1,2})corhigher$/i);
+  match = slug.match(/-(\d{1,3})([cf])orbelow$/i);
   if (match) {
-    return { kind: "gte", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "lte",
+      unit: match[2],
+      value: Number.parseInt(match[1], 10),
+    });
   }
 
-  match = slug.match(/-(\d{1,2})c$/i);
+  match = slug.match(/-(\d{1,3})([cf])orhigher$/i);
   if (match) {
-    return { kind: "exact", value: Number.parseInt(match[1], 10) };
+    return buildTemperatureBucket({
+      kind: "gte",
+      unit: match[2],
+      value: Number.parseInt(match[1], 10),
+    });
+  }
+
+  match = slug.match(/-(\d{1,3})([cf])$/i);
+  if (match) {
+    return buildTemperatureBucket({
+      kind: "exact",
+      unit: match[2],
+      value: Number.parseInt(match[1], 10),
+    });
   }
 
   return null;
@@ -1153,11 +1602,7 @@ function passesTemperatureRule(cityKey, bucket, config) {
     return false;
   }
 
-  if (bucket.kind === "exact" || bucket.kind === "gte") {
-    return bucket.value >= minimumTemperature;
-  }
-
-  return false;
+  return bucket.lowerC !== null && bucket.lowerC >= minimumTemperature;
 }
 
 function formatTemperatureRuleSummary(config) {
@@ -1214,15 +1659,19 @@ function buildMarketWatchItem(event, market, config) {
 
   const noTokenId = getOutcomeTokenIdByLabel(market, "no");
 
-  const cityKey =
-    inferCityKeyFromText(`${event?.title || ""} ${event?.slug || ""}`) ||
-    inferCityKeyFromText(`${market?.question || ""} ${market?.slug || ""}`);
-  if (!cityKey || !config.monitoredCities.includes(cityKey)) {
+  const cityDescriptor =
+    inferCityDescriptorFromText(event?.title, event?.slug) ??
+    inferCityDescriptorFromText(market?.question, market?.slug);
+  if (!cityDescriptor?.cityKey) {
+    return null;
+  }
+
+  if (!config.monitorAllCities && !citySelectionIncludes(config.monitoredCities, cityDescriptor.cityKey)) {
     return null;
   }
 
   const temperatureBucket = parseTemperatureBucket(market);
-  if (!passesTemperatureRule(cityKey, temperatureBucket, config)) {
+  if (!passesTemperatureRule(cityDescriptor.cityKey, temperatureBucket, config)) {
     return null;
   }
 
@@ -1237,8 +1686,8 @@ function buildMarketWatchItem(event, market, config) {
     tokenId: yesTokenId,
     outcomeLabel: "yes",
     strategyType: "threshold-yes",
-    cityKey,
-    cityLabel: getCityDisplayLabel(cityKey),
+    cityKey: cityDescriptor.cityKey,
+    cityLabel: cityDescriptor.cityLabel ?? getCityDisplayLabel(cityDescriptor.cityKey),
     parsedDate: parseWeatherDate(event.title) || parseWeatherDate(event.slug),
     temperatureBucket,
     yesOutcomePrice: getOutcomePriceByLabel(market, "yes"),
@@ -1252,17 +1701,7 @@ function formatTemperatureBucket(bucket) {
     return "unknown";
   }
 
-  if (bucket.kind === "exact") {
-    return `${bucket.value}\u00b0C`;
-  }
-  if (bucket.kind === "gte") {
-    return `${bucket.value}\u00b0C+`;
-  }
-  if (bucket.kind === "lte") {
-    return `<=${bucket.value}\u00b0C`;
-  }
-
-  return "unknown";
+  return bucket.label ?? "unknown";
 }
 
 function getForecastBasisTemperature(forecast, weatherCategory) {
@@ -1299,7 +1738,19 @@ function bucketPassesForecastWindow(bucket, forecastWindow) {
     return false;
   }
 
-  return bucket.value >= forecastWindow.lowerC && bucket.value <= forecastWindow.upperC;
+  if (bucket.lowerC !== null && bucket.upperC !== null) {
+    return bucket.upperC >= forecastWindow.lowerC && bucket.lowerC <= forecastWindow.upperC;
+  }
+
+  if (bucket.lowerC !== null) {
+    return bucket.lowerC <= forecastWindow.upperC;
+  }
+
+  if (bucket.upperC !== null) {
+    return bucket.upperC >= forecastWindow.lowerC;
+  }
+
+  return false;
 }
 
 function getBucketGapFromForecastWindow(bucket, forecastWindow) {
@@ -1307,22 +1758,26 @@ function getBucketGapFromForecastWindow(bucket, forecastWindow) {
     return null;
   }
 
-  if (bucket.kind === "exact") {
-    if (bucket.value < forecastWindow.lowerC) {
-      return forecastWindow.lowerC - bucket.value;
+  if (bucket.lowerC !== null && bucket.upperC !== null) {
+    if (bucket.upperC < forecastWindow.lowerC) {
+      return Number((forecastWindow.lowerC - bucket.upperC).toFixed(4));
     }
-    if (bucket.value > forecastWindow.upperC) {
-      return bucket.value - forecastWindow.upperC;
+    if (bucket.lowerC > forecastWindow.upperC) {
+      return Number((bucket.lowerC - forecastWindow.upperC).toFixed(4));
     }
     return 0;
   }
 
-  if (bucket.kind === "gte") {
-    return bucket.value > forecastWindow.upperC ? bucket.value - forecastWindow.upperC : 0;
+  if (bucket.lowerC !== null) {
+    return bucket.lowerC > forecastWindow.upperC
+      ? Number((bucket.lowerC - forecastWindow.upperC).toFixed(4))
+      : 0;
   }
 
-  if (bucket.kind === "lte") {
-    return bucket.value < forecastWindow.lowerC ? forecastWindow.lowerC - bucket.value : 0;
+  if (bucket.upperC !== null) {
+    return bucket.upperC < forecastWindow.lowerC
+      ? Number((forecastWindow.lowerC - bucket.upperC).toFixed(4))
+      : 0;
   }
 
   return null;
@@ -1366,7 +1821,7 @@ function shouldCreateTailNoWatchItem(watchItem, config) {
     return false;
   }
 
-  if (!config.tailNoAllowedCities.includes(watchItem.cityKey)) {
+  if (!citySelectionIncludes(config.tailNoAllowedCities, watchItem.cityKey)) {
     return false;
   }
 
@@ -1386,15 +1841,39 @@ function formatForecastWindow(forecastWindow) {
   return `预报 ${formatTemperatureValue(forecastWindow.lowC)}~${formatTemperatureValue(forecastWindow.highC)}，监控 ${formatTemperatureValue(forecastWindow.lowerC)}~${formatTemperatureValue(forecastWindow.upperC)}`;
 }
 
-async function fetchWeatherForecast(cityKey, dateKey, config) {
+async function resolveWeatherForecastCoordinates(cityKey, cityLabel, config) {
+  const existingCoordinates = config.weatherForecastCityCoordinates[cityKey];
+  if (existingCoordinates) {
+    return existingCoordinates;
+  }
+
+  const searchName = cityLabel || getCityDisplayLabel(cityKey);
+  const geocodeResponse = await fetchJson(
+    buildOpenMeteoGeocodingUrl("/v1/search", {
+      name: searchName,
+      count: 1,
+      language: "en",
+      format: "json",
+    }),
+  );
+  const result = Array.isArray(geocodeResponse?.results) ? geocodeResponse.results[0] : null;
+  const latitude = toNumber(result?.latitude);
+  const longitude = toNumber(result?.longitude);
+  if (latitude === null || longitude === null) {
+    throw new Error(`No weather forecast coordinates configured for ${cityLabel || getCityLogLabel(cityKey)}.`);
+  }
+
+  const coordinates = { latitude, longitude };
+  config.weatherForecastCityCoordinates[cityKey] = coordinates;
+  return coordinates;
+}
+
+async function fetchWeatherForecast(cityKey, cityLabel, dateKey, config) {
   if (config.weatherForecastProvider !== "open-meteo") {
     throw new Error(`Unsupported weather forecast provider: ${config.weatherForecastProvider}`);
   }
 
-  const coordinates = config.weatherForecastCityCoordinates[cityKey];
-  if (!coordinates) {
-    throw new Error(`No weather forecast coordinates configured for ${getCityLogLabel(cityKey)}.`);
-  }
+  const coordinates = await resolveWeatherForecastCoordinates(cityKey, cityLabel, config);
 
   const data = await fetchJson(
     buildOpenMeteoUrl("/v1/forecast", {
@@ -1411,18 +1890,19 @@ async function fetchWeatherForecast(cityKey, dateKey, config) {
   const times = Array.isArray(daily.time) ? daily.time : [];
   const index = times.findIndex((time) => String(time) === dateKey);
   if (index === -1) {
-    throw new Error(`No weather forecast returned for ${getCityLogLabel(cityKey)} ${dateKey}.`);
+    throw new Error(`No weather forecast returned for ${cityLabel || getCityLogLabel(cityKey)} ${dateKey}.`);
   }
 
   const highC = toNumber(daily.temperature_2m_max?.[index]);
   const lowC = toNumber(daily.temperature_2m_min?.[index]);
   if (highC === null && lowC === null) {
-    throw new Error(`Weather forecast has no temperature range for ${getCityLogLabel(cityKey)} ${dateKey}.`);
+    throw new Error(`Weather forecast has no temperature range for ${cityLabel || getCityLogLabel(cityKey)} ${dateKey}.`);
   }
 
   return {
     provider: config.weatherForecastProvider,
     cityKey,
+    cityLabel: cityLabel || getCityDisplayLabel(cityKey),
     dateKey,
     highC,
     lowC,
@@ -1440,6 +1920,7 @@ async function applyWeatherForecastFilter(watchItems, config) {
     const groupKey = `${item.cityKey}::${dateKey}`;
     const existing = groups.get(groupKey) ?? {
       cityKey: item.cityKey,
+      cityLabel: item.cityLabel,
       dateKey,
       items: [],
     };
@@ -1458,7 +1939,7 @@ async function applyWeatherForecastFilter(watchItems, config) {
 
     let forecastWindow;
     try {
-      const forecast = await fetchWeatherForecast(group.cityKey, group.dateKey, config);
+      const forecast = await fetchWeatherForecast(group.cityKey, group.cityLabel, group.dateKey, config);
       forecastWindow = buildForecastWindow(forecast, config);
     } catch (error) {
       if (!config.weatherForecastFilterEnabled) {
@@ -1515,7 +1996,10 @@ function isEligibleDiscoveredEvent(event, cityKey, config) {
   if (!matchesWeatherCategory(event, config.weatherCategory)) {
     return false;
   }
-  if (!matchesAllowedCity(event, [cityKey])) {
+  if (cityKey && !matchesAllowedCity(event, [cityKey])) {
+    return false;
+  }
+  if (!cityKey && !inferCityDescriptorFromText(event?.title, event?.slug)) {
     return false;
   }
 
@@ -1554,8 +2038,46 @@ async function discoverWeatherEventsForCity(cityKey, config) {
   return [...eventMap.values()];
 }
 
+async function discoverAllWeatherEvents(config) {
+  const eventMap = new Map();
+  const searchTerms = WEATHER_CATEGORY_SEARCH_TERMS[config.weatherCategory] ?? WEATHER_CATEGORY_SEARCH_TERMS.any;
+  const queries = [...new Set([...searchTerms, ...searchTerms.map((term) => `${term} in`)])];
+
+  for (const query of queries) {
+    let searchResults;
+    try {
+      searchResults = await fetchJson(buildGammaUrl("/public-search", { q: query }));
+    } catch (error) {
+      void error;
+      continue;
+    }
+
+    const eventMatches = Array.isArray(searchResults?.events) ? searchResults.events : [];
+    for (const event of eventMatches) {
+      if (isEligibleDiscoveredEvent(event, null, config)) {
+        eventMap.set(event.slug, event);
+      }
+    }
+  }
+
+  return [...eventMap.values()];
+}
+
 async function discoverWeatherEvents(config) {
   const uniqueEvents = new Map();
+
+  if (config.monitorAllCities) {
+    const allCityEvents = await discoverAllWeatherEvents(config);
+    for (const event of allCityEvents) {
+      uniqueEvents.set(event.slug, event);
+    }
+
+    return [...uniqueEvents.values()].sort((left, right) => {
+      const leftDate = parseWeatherDate(left?.title) || parseWeatherDate(left?.slug);
+      const rightDate = parseWeatherDate(right?.title) || parseWeatherDate(right?.slug);
+      return (leftDate?.getTime() ?? Number.MAX_SAFE_INTEGER) - (rightDate?.getTime() ?? Number.MAX_SAFE_INTEGER);
+    });
+  }
 
   for (const cityKey of config.monitoredCities) {
     const cityEvents = await discoverWeatherEventsForCity(cityKey, config);
@@ -1874,7 +2396,9 @@ async function buildRuntimeContext(clientContext, watchItems, config) {
     fetchCurrentPositionsForUser(clientContext.funderAddress),
     refreshEventSnapshots(watchItems, config),
     clientContext.client.getOpenOrders(),
-    config.dryRun ? Promise.resolve(null) : fetchCollateralSnapshot(clientContext.client),
+    config.dryRun && !config.dynamicOrderSizingEnabled
+      ? Promise.resolve(null)
+      : fetchCollateralSnapshot(clientContext.client),
   ];
   const [positionsResult, eventSnapshotsResult, openOrdersResult, collateralResult] = await Promise.allSettled(promises);
 
@@ -1954,6 +2478,7 @@ function getTokenState(state, tokenId) {
     lastThinLiquiditySkipLogAt: null,
     lastEventExposureSkipLogAt: null,
     lastRelativeValueSkipLogAt: null,
+    lastSizingSkipLogAt: null,
     lastExecutionMode: null,
     lastPositionSkipLogAt: null,
     lastDominantEventSkipLogAt: null,
@@ -2174,6 +2699,20 @@ function logRelativeValueSkip(tokenState, watchItem, assessment, config, referen
   return true;
 }
 
+function logSizingSkip(tokenState, watchItem, message, qualityScore) {
+  if (!shouldLogAt(tokenState.lastSizingSkipLogAt, SIZING_SKIP_LOG_INTERVAL_MS)) {
+    return false;
+  }
+
+  const loggedAt = now();
+  tokenState.lastSizingSkipLogAt = loggedAt;
+  const qualityText = qualityScore === null || qualityScore === undefined ? "n/a" : qualityScore.toFixed(2);
+  console.log(
+    `[${loggedAt}] Dynamic sizing skip | ${getWatchItemLogPrefix(watchItem)} | quality ${qualityText} | ${message}`,
+  );
+  return true;
+}
+
 function printConfigSummary(config, watchItems, statePath, clientContext) {
   console.log("策略配置");
   console.log("========");
@@ -2199,7 +2738,7 @@ function printConfigSummary(config, watchItems, statePath, clientContext) {
   console.log(`仅挂单: ${config.postOnly}`);
   console.log(`模拟模式: ${config.dryRun}`);
   console.log(`自动发现天气市场: ${config.autoDiscoverWeatherMarkets}`);
-  console.log(`城市: ${config.allowedCities.map(getCityLogLabel).join("、")}`);
+  console.log(`城市: ${config.monitorAllCities ? "全部城市" : config.allowedCities.map(getCityLogLabel).join("、")}`);
   console.log(`天气类别: ${config.weatherCategory}`);
   console.log(`主导结果跳过阈值: ${config.dominantYesSkipThreshold}`);
   console.log(`气象预报过滤: ${config.weatherForecastFilterEnabled}`);
@@ -2207,12 +2746,19 @@ function printConfigSummary(config, watchItems, statePath, clientContext) {
   console.log(`气象窗口: 预报高/低温上下 ${config.weatherForecastWindowC}\u00b0C`);
   console.log(`气象时区: ${config.weatherForecastTimezone}`);
   console.log(`温度规则: ${formatTemperatureRuleSummary(config)}`);
+  console.log(`动态仓位: ${config.dynamicOrderSizingEnabled}`);
+  console.log(`动态最小仓位: ${config.dynamicOrderSizingMinShares}`);
+  console.log(`动态 YES 最大仓位: ${config.dynamicOrderSizingMaxShares}`);
+  console.log(`动态 Tail-NO 最大仓位: ${config.dynamicOrderSizingTailNoMaxShares}`);
+  console.log(`动态单笔余额占比: ${config.dynamicOrderSizingMinBalanceFraction} ~ ${config.dynamicOrderSizingMaxBalanceFraction}`);
+  console.log(`动态吃单深度系数: ${config.dynamicOrderSizingTopLevelDepthFraction}`);
+  console.log(`动态最小质量分: ${config.dynamicOrderSizingMinQualityScore}`);
   console.log(`状态文件: ${statePath}`);
   console.log(`监控 YES 数量: ${watchItems.length}`);
   console.log(`Tail-NO strategy: ${config.tailNoStrategyEnabled}`);
   console.log(`Tail-NO order size: ${config.tailNoOrderSize}`);
   console.log(`Tail-NO max tokens per event: ${config.tailNoMaxStrategyTokensPerEvent}`);
-  console.log(`Tail-NO cities: ${config.tailNoAllowedCities.map(getCityLogLabel).join("、")}`);
+  console.log(`Tail-NO cities: ${isAllCitiesSelection(config.tailNoAllowedCities) ? "全部城市" : config.tailNoAllowedCities.map(getCityLogLabel).join("、")}`);
   console.log(`Tail-NO trigger price: ${config.tailNoTriggerPrice}`);
   console.log(`Tail-NO rearm price: ${config.tailNoRearmPrice}`);
   console.log(`Tail-NO max order price: ${config.tailNoMaxOrderPrice}`);
@@ -2348,7 +2894,7 @@ function isTailNoWatchItem(watchItem) {
 }
 
 function getEntryOrderSize(config, watchItem) {
-  return isTailNoWatchItem(watchItem) ? config.tailNoOrderSize : config.orderSize;
+  return getStaticEntryOrderSize(config, watchItem);
 }
 
 function getStrategyMaxTokensPerEvent(config, watchItem) {
@@ -2362,7 +2908,7 @@ function getStrategyAllowedCities(config, watchItem) {
 }
 
 function isStrategyCityAllowed(config, watchItem) {
-  return getStrategyAllowedCities(config, watchItem).includes(watchItem.cityKey);
+  return citySelectionIncludes(getStrategyAllowedCities(config, watchItem), watchItem.cityKey);
 }
 
 function getEventExposureKey(watchItem) {
@@ -2426,21 +2972,25 @@ function passesTailNoDominantYesCheck(config, watchItem, eventSnapshot) {
   return (eventSnapshot?.highestYesPrice ?? 0) >= config.tailNoDominantYesThreshold;
 }
 
-function summarizeEntryOrderResponse(response, config, watchItem) {
+function summarizeEntryOrderResponse(response, config, watchItem, entryPlan) {
   const prefix = getWatchItemLogPrefix(watchItem);
   const outcomeLabel = String(watchItem.outcomeLabel || "yes").toUpperCase();
-  const orderPrice = formatPrice(response?.desiredPrice ?? getEntryOrderPrice(config, watchItem, watchItem.outcomePrice));
-  const orderSize = getEntryOrderSize(config, watchItem);
+  const orderPrice = formatPrice(response?.desiredPrice ?? entryPlan?.orderPrice ?? getEntryOrderPrice(config, watchItem, watchItem.outcomePrice));
+  const orderSize = entryPlan?.orderSize ?? getEntryOrderSize(config, watchItem);
+  const qualityText =
+    entryPlan?.qualityScore === null || entryPlan?.qualityScore === undefined
+      ? ""
+      : ` | quality ${entryPlan.qualityScore.toFixed(2)}`;
   if (config.dryRun) {
-    return `[${now()}] Simulated entry | ${prefix} | BUY ${outcomeLabel} @ ${orderPrice} | ${orderSize} shares`;
+    return `[${now()}] Simulated entry | ${prefix} | BUY ${outcomeLabel} @ ${orderPrice} | ${orderSize} shares${qualityText}`;
   }
 
   const orderId = response?.orderID ?? response?.orderId ?? response?.id ?? null;
   if (orderId) {
-    return `[${now()}] Entry placed | ${prefix} | BUY ${outcomeLabel} @ ${orderPrice} | ${orderSize} shares | order ${orderId}`;
+    return `[${now()}] Entry placed | ${prefix} | BUY ${outcomeLabel} @ ${orderPrice} | ${orderSize} shares${qualityText} | order ${orderId}`;
   }
 
-  return `[${now()}] Entry placed | ${prefix} | BUY ${outcomeLabel} @ ${orderPrice} | ${orderSize} shares`;
+  return `[${now()}] Entry placed | ${prefix} | BUY ${outcomeLabel} @ ${orderPrice} | ${orderSize} shares${qualityText}`;
 }
 
 function summarizeTakeProfitOrderResponse(response, sellPrice, sellSize, config, watchItem) {
@@ -2457,13 +3007,13 @@ function summarizeTakeProfitOrderResponse(response, sellPrice, sellSize, config,
   return `[${now()}] 止盈挂单成功 | ${prefix} | SELL YES @ ${formatPrice(sellPrice)} | ${sellSize} 份`;
 }
 
-async function placeThresholdOrder(client, watchItem, tickSize, negRisk, config, referencePrice) {
-  const desiredPrice = roundToTick(getEntryOrderPrice(config, watchItem, referencePrice), Number(tickSize));
+async function placeThresholdOrder(client, watchItem, tickSize, negRisk, config, entryPlan) {
+  const desiredPrice = roundToTick(entryPlan.orderPrice, Number(tickSize));
   const desiredOrder = {
     tokenID: watchItem.tokenId,
     side: Side.BUY,
     price: desiredPrice,
-    size: getEntryOrderSize(config, watchItem),
+    size: entryPlan.orderSize,
   };
 
   if (config.dryRun) {
@@ -2752,11 +3302,23 @@ async function evaluateWatchItem(client, config, state, watchItem, runtimeContex
     return logRelativeValueSkip(tokenState, watchItem, relativeAssessment, config, referencePrice);
   }
 
-  const tradeBlockReason = buildTradeBlockReason(
-    runtimeContext.collateralStatus,
+  const entryPlan = buildEntryPlan(
     config,
     watchItem,
+    runtimeContext.collateralStatus,
     referencePrice,
+    relativeAssessment,
+    eventSnapshot,
+    bestAskSize,
+  );
+  if (entryPlan.skipReason) {
+    return logSizingSkip(tokenState, watchItem, entryPlan.skipReason, entryPlan.qualityScore);
+  }
+
+  const tradeBlockReason = buildTradeBlockReason(
+    runtimeContext.collateralStatus,
+    entryPlan.orderPrice,
+    entryPlan.orderSize,
   );
   if (tradeBlockReason) {
     if (shouldLogAt(lastInsufficientCollateralLogAt, INSUFFICIENT_COLLATERAL_LOG_INTERVAL_MS)) {
@@ -2774,7 +3336,7 @@ async function evaluateWatchItem(client, config, state, watchItem, runtimeContex
 
   let response;
   try {
-    response = await placeThresholdOrder(client, watchItem, tickSize, negRisk, config, referencePrice);
+    response = await placeThresholdOrder(client, watchItem, tickSize, negRisk, config, entryPlan);
   } catch (error) {
     if (isInsufficientBalanceAllowanceError(error)) {
       if (shouldLogAt(lastInsufficientCollateralLogAt, INSUFFICIENT_COLLATERAL_LOG_INTERVAL_MS)) {
@@ -2797,7 +3359,7 @@ async function evaluateWatchItem(client, config, state, watchItem, runtimeContex
   );
   if (supportsTakeProfit(watchItem, config)) {
     tokenState.takeProfit =
-      buildTakeProfitPlan(config, roundToTick(getEntryOrderPrice(config, watchItem, referencePrice), Number(tickSize))) ?? {
+      buildTakeProfitPlan(config, roundToTick(entryPlan.orderPrice, Number(tickSize))) ?? {
         entryPrice: null,
         targetPrice: null,
         sellFraction: null,
@@ -2808,7 +3370,7 @@ async function evaluateWatchItem(client, config, state, watchItem, runtimeContex
       };
   }
 
-  console.log(summarizeEntryOrderResponse(response, config, watchItem));
+  console.log(summarizeEntryOrderResponse(response, config, watchItem, entryPlan));
   return true;
 }
 

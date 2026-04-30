@@ -137,19 +137,20 @@ npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks
 
 ## 4. Threshold buyer
 
-这个脚本启动时可以自动发现指定城市的活跃天气市场。
+这个脚本启动时可以自动发现活跃天气市场。
 
 默认策略如下：
 
-- 自动发现 `Shenzhen`、`Shanghai`、`Beijing`、`Hong Kong`、`Guangzhou`、`Taipei` 的活跃 `highestTemperature` 天气事件
+- 默认自动发现所有城市的活跃 `highestTemperature` 天气事件
 - 监控这些事件下面的所有 YES 市场
 - 当观察到的 YES 概率低于 `0.10` 时，以 `0.10` 挂一笔 `BUY YES` 限价单
-- 固定下单数量为 `20` 份
+- 下单数量会根据账户余额、信号质量和盘口顶层深度动态计算
 - 成功挂出买单后，脚本会为该 token 记录一份止盈计划
 - 当 YES 到达固定止盈价 `0.80` 时，自动对整仓挂出一笔 `SELL YES`
 - 当 `weatherForecastFilterEnabled=true` 时，会拉取天气预报区间，只监控靠近预报高温或低温的桶
 - 所有城市都使用同一套对称规则：先把预报高温四舍五入，再监控 `±1°C`
 - 例如，预报高温是 `28.6°C`，四舍五入后为 `29°C`，那么脚本只会保留 `28°C`、`29°C`、`30°C`
+- 对于全球市场常见的华氏温度范围桶，例如 `77-78°F`，脚本也会自动换算到摄氏再和预报窗口比较
 
 这套策略还包含一个可选的高确定性 `NO` 分支。开启后，它会使用同一套天气预报窗口找出看起来被排除的桶，然后等待同事件中的另一个桶明显占优，再在接近结算时买入高价 `NO`。
 
@@ -179,7 +180,7 @@ npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks
   "postOnly": false,
   "dryRun": true,
   "autoDiscoverWeatherMarkets": true,
-  "allowedCities": ["Shenzhen", "Shanghai", "Beijing", "Hong Kong", "Guangzhou", "Taipei"],
+  "allowedCities": ["*"],
   "weatherCategory": "highestTemperature",
   "weatherForecastFilterEnabled": true,
   "weatherForecastProvider": "open-meteo",
@@ -188,7 +189,7 @@ npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks
   "tailNoStrategyEnabled": false,
   "tailNoOrderSize": 20,
   "tailNoMaxStrategyTokensPerEvent": 2,
-  "tailNoAllowedCities": ["Shenzhen", "Shanghai", "Beijing", "Hong Kong", "Guangzhou", "Taipei"],
+  "tailNoAllowedCities": ["*"],
   "tailNoTriggerPrice": 0.98,
   "tailNoRearmPrice": 0.95,
   "tailNoMaxOrderPrice": 0.999,
@@ -196,6 +197,14 @@ npm run auto-quote -- --token-id <TOKEN_ID> --side BUY --size 25 --improve-ticks
   "tailNoMaxDaysAhead": 0,
   "tailNoRequireDominantYes": true,
   "tailNoDominantYesThreshold": 0.93,
+  "dynamicOrderSizingEnabled": true,
+  "dynamicOrderSizingMinShares": 3,
+  "dynamicOrderSizingMaxShares": 40,
+  "dynamicOrderSizingTailNoMaxShares": 20,
+  "dynamicOrderSizingMinBalanceFraction": 0.01,
+  "dynamicOrderSizingMaxBalanceFraction": 0.04,
+  "dynamicOrderSizingTopLevelDepthFraction": 0.9,
+  "dynamicOrderSizingMinQualityScore": 0.35,
   "minTemperatureByCity": {},
   "stateFile": ".polymarket-threshold-state.json",
   "targets": []
@@ -239,6 +248,11 @@ npm run threshold-buyer -- --config my-markets.json
 - `takeProfitEnabled=true` 表示在买单挂出后，脚本会继续监控已持有的 YES 仓位是否满足止盈条件。
 - `takeProfitTargetPrice=0.8` 表示当 YES 到达 `0.80` 时，脚本会挂一笔整仓卖单。
 - live 模式下脚本会自动发送 heartbeat，保证官方要求的 resting-order 保活流程持续运行。
+- `dynamicOrderSizingEnabled=true` 表示脚本会按账户余额、信号质量和盘口顶层深度自动计算下单份额，而不是死板使用固定仓位。
+- `dynamicOrderSizingMaxShares` 和 `dynamicOrderSizingTailNoMaxShares` 是 YES / Tail-NO 两条分支各自的动态仓位上限。
+- `dynamicOrderSizingMinBalanceFraction` 到 `dynamicOrderSizingMaxBalanceFraction` 控制单笔最多动用账户多少比例的可用 collateral。
+- `dynamicOrderSizingTopLevelDepthFraction=0.9` 表示动态仓位默认不会吃掉超过最优卖一展示深度的 90%，用来控制执行滑点。
+- `dynamicOrderSizingMinQualityScore` 会要求信号先达到最低质量分，再允许开仓。
 - `minTriggerLiquidityShares=5` 表示只有在当前最优卖价至少展示 `5` 份深度时，才会触发 BUY。
 - `minTakeProfitLiquidityShares=5` 表示只有在当前最优买价至少展示 `5` 份深度时，才会触发止盈。
 - `maxStrategyTokensPerEvent=2` 表示每个天气事件最多同时持有 `2` 个活跃 YES token，用来降低互斥桶之间非原子执行的风险。
@@ -247,12 +261,12 @@ npm run threshold-buyer -- --config my-markets.json
 - `relativeMispricingMinDiscount=0.03` 表示当前最优卖价必须至少比该事件监控桶的中位数低 `0.03`。
 - `relativeMispricingMaxPriceRank=2` 表示当前最优卖价必须排在该事件最便宜的前 `2` 个监控桶之内。
 - 如果同一个 YES token 已经存在未成交的 `BUY` 订单，脚本会先取消它们，再挂出新的阈值单。
-- `autoDiscoverWeatherMarkets=true` 表示脚本启动时会自动扫描你配置城市下的活跃天气事件，不需要手动填写事件 URL。
-- `allowedCities` 可以把监控范围限制在指定城市，例如 `Shenzhen`、`Shanghai`、`Beijing`、`Hong Kong`、`Guangzhou`、`Taipei`。
-- `tailNoAllowedCities` 是可选 `NO` 分支独立的城市白名单；如果你自己的配置里不写，可以保持和 `allowedCities` 一样，或者只收窄到适合做近结算 NO 扫尾的城市。
+- `autoDiscoverWeatherMarkets=true` 表示脚本启动时会自动扫描活跃天气事件，不需要手动填写事件 URL。
+- `allowedCities=["*"]` 表示监控所有城市；如果你之后想收窄范围，也可以把它改回具体城市列表。
+- `tailNoAllowedCities=["*"]` 是可选 `NO` 分支的城市范围；和 YES 一样，也支持全城市或指定城市列表。
 - `weatherCategory=highestTemperature` 表示只监控最高温市场。
 - `weatherForecastFilterEnabled=true` 表示脚本会在交易前使用 Open-Meteo 预报数据对温度桶做过滤。
-- `weatherForecastWindowC=1` 表示每个城市只保留处于四舍五入后的预报高温或低温 `±1°C` 范围内的桶；对于最高温市场，使用的是每日预报最高温。
+- `weatherForecastWindowC=1` 表示每个城市只保留处于四舍五入后的预报高温或低温 `±1°C` 范围内的桶；对于最高温市场，使用的是每日预报最高温。华氏桶会自动先换算回摄氏再比较。
 - `weatherForecastTimezone=Asia/Shanghai` 用来让预报日期与中国大陆或香港本地日期保持一致。
 - `tailNoMinBucketGapC=2` 表示可选 `NO` 分支只考虑那些至少离预报窗口 `2°C` 之外的桶。
 - `tailNoMaxDaysAhead=0` 表示可选 `NO` 分支只关注当天市场，更接近临近结算时的高确定性扫尾，而不是长周期观点单。
